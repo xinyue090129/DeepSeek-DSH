@@ -109,6 +109,18 @@ h1 { font-size: 26px; font-weight: 600; margin-bottom: 0; letter-spacing: -.5px;
 .environment-copy { gap: 6px; }
 .logs-section { margin-top: 28px; }
 .logs-heading { margin-bottom: 15px; }
+.log-tools { display: flex; align-items: center; gap: 14px; }
+.log-live { display: inline-flex; align-items: center; gap: 7px; margin-left: 11px; font-size: 12px; font-weight: 500; letter-spacing: .2px; color: #6ed9a6; }
+.log-live i { width: 7px; height: 7px; border-radius: 50%; background: #2ba471; box-shadow: 0 0 0 0 rgba(43,164,113,.5); animation: logPulse 1.8s ease-out infinite; }
+.log-live.paused { color: #efc36e; }
+.log-live.paused i { background: #d98a00; animation: none; box-shadow: none; }
+.log-live.offline { color: #8b95a3; }
+.log-live.offline i { background: #5b6472; animation: none; box-shadow: none; }
+@keyframes logPulse { 0% { box-shadow: 0 0 0 0 rgba(43,164,113,.45); } 70% { box-shadow: 0 0 0 7px rgba(43,164,113,0); } 100% { box-shadow: 0 0 0 0 rgba(43,164,113,0); } }
+.log-count { margin-left: 10px; font-size: 12px; font-weight: 500; color: #77828f; font-variant-numeric: tabular-nums; }
+body.light .log-count { color: #6a7686; }
+body.light .log-live { color: #1f8b58; }
+body.light .log-live.offline { color: #7b8794; }
 .log-window { min-height: 220px; max-height: 310px; overflow: auto; padding: 20px 21px; border-radius: 17px; background: linear-gradient(145deg,#10151c,#11161d); color: #d1d9e2; font: 13px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace; border: 1px solid rgba(255,255,255,.035); }
 .log-line { white-space: pre-wrap; overflow-wrap: anywhere; }
 .log-line.info { color: #c5d6ed; }
@@ -116,6 +128,7 @@ h1 { font-size: 26px; font-weight: 600; margin-bottom: 0; letter-spacing: -.5px;
 .log-line.warn { color: #efc36e; }
 .log-line.error { color: #ff8189; }
 .log-line.muted { color: #aab4c0; }
+.log-line.time { color: #6c7c92; }
 .bottom-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .bottom-actions .secondary-button { min-height: 66px; font-size: 15px; }
 .tabs-panel { margin-top: 24px; padding: 0 22px 18px; }

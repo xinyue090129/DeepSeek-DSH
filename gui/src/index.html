@@ -24,8 +24,8 @@
     <aside class="sidebar">
       <nav class="nav-list" aria-label="主导航">
         <button class="nav-item active" data-page="overview"><span class="nav-icon">◈</span><span>DSHA</span></button>
-        <button class="nav-item" data-page="dashboard"><span class="nav-icon">⌕</span><span>仪表盘</span></button>
-        <button class="nav-item" data-page="projects"><span class="nav-icon">♙</span><span>项目</span></button>
+        <button class="nav-item" data-page="plugins"><span class="nav-icon">⌕</span><span>插件</span></button>
+        <button class="nav-item" data-page="settings"><span class="nav-icon">♙</span><span>设置</span></button>
       </nav>
       <div class="sidebar-bottom">
         <div class="sidebar-version">DSHA Desktop <span>UI Preview</span></div>
@@ -102,7 +102,14 @@
           </button>
 
           <section class="logs-section">
-            <div class="logs-heading"><h3>启动日志</h3><button class="text-button" id="logsTabButton">回到顶部</button></div>
+            <div class="logs-heading">
+              <h3>启动日志<span class="log-live" id="logLive"><i></i>实时</span><span class="log-count" id="logCount"></span></h3>
+              <div class="log-tools">
+                <button class="text-button" id="logPauseButton">暂停</button>
+                <button class="text-button" id="logClearButton">清屏</button>
+                <button class="text-button" id="logsTabButton">回到顶部</button>
+              </div>
+            </div>
             <div class="log-window" id="logWindow" aria-live="polite">
               <div class="log-line muted">等待启动…</div>
             </div>

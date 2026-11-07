@@ -58,6 +58,8 @@
     backendUp: false,
     busy: false,
     autoScroll: true,
+    paused: false,
+    localOffset: 0,   // 已渲染的绝对行号（含被后端裁掉的部分）
     ready: false
   };
 
@@ -98,7 +100,6 @@
   function appendLogs(lines) {
     if (!lines || !lines.length) return;
     const box = $("logWindow");
-    if (st.since === 0) box.innerHTML = "";
     const frag = document.createDocumentFragment();
     for (const raw of lines) {
       const d = document.createElement("div");
@@ -107,8 +108,22 @@
       frag.appendChild(d);
     }
     box.appendChild(frag);
-    while (box.childElementCount > 1500) box.removeChild(box.firstElementChild);
+    while (box.childElementCount > 3000) box.removeChild(box.firstElementChild);
     if (st.autoScroll) box.scrollTop = box.scrollHeight;
+  }
+
+  function clearLogs() {
+    $("logWindow").innerHTML = "";
+    st.localOffset = 0;
+  }
+
+  function setLive(mode) {
+    const el = $("logLive");
+    if (!el) return;
+    el.classList.toggle("paused", mode === "paused");
+    el.classList.toggle("offline", mode === "offline");
+    el.lastChild.nodeValue = mode === "paused" ? "已暂停"
+      : mode === "offline" ? "重连中" : "实时";
   }
 
   // ---------------------------------------------------------------- 渲染
@@ -179,23 +194,85 @@
     $("stopButton").disabled = st.busy || s === "stopped";
     $("restartButton").disabled = st.busy || s === "stopped";
     $("safeStartButton").disabled = st.busy || running;
+
+    // 日志行数放在标题右侧，长跑时也能看出流有没有在动
+    const counter = $("logCount");
+    if (counter) counter.textContent = st.localOffset ? `${st.localOffset} 行` : "";
   }
 
   // ---------------------------------------------------------------- 轮询
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /** 用一帧后端响应驱动界面状态；失败时兜底 undefined。 */
+  function applyState(r) {
+    const it = st.instance;
+    if (!it || !r) return;
+    const port = typeof r.port === "number" ? r.port : 0;
+    const changed = r.state !== it.state || port !== it.actualPort || r.url !== it.url;
+    if (changed) {
+      it.state = r.state;
+      it.actualPort = port;
+      it.url = r.url;
+      render();
+    }
+  }
+
+  /**
+   * 拉一次日志并渲染。
+   * wait=true 时后端长轮询（最多挂 2 秒），有日志立即返回 —— 这就是「实时」。
+   */
+  async function pullLogs(wait) {
+    const it = st.instance;
+    if (!it || st.paused) return;
+    const q = `/api/instances/logs?id=${encodeURIComponent(it.id)}&since=${st.since}` + (wait ? "&wait=1" : "");
+    const r = await api(q);
+    const lines = r.lines || [];
+    if (lines.length) {
+      appendLogs(lines);
+    }
+    // since 是对「后端当前缓冲」的游标，total 可能因环形裁剪而回落
+    st.since = typeof r.total === "number" ? r.total : st.since;
+    st.localOffset = (typeof r.dropped === "number" ? r.dropped : 0) + st.since;
+    applyState(r);
+    const counter = $("logCount");
+    if (counter) counter.textContent = st.localOffset ? `${st.localOffset} 行` : "";
+  }
+
+  /** 常驻的日志循环：空闲时长轮询保状态新鲜，有日志时立刻刷。 */
+  async function logLoop() {
+    let backoff = 400;
+    while (true) {
+      if (st.paused) {
+        await sleep(400);
+        backoff = 400;
+        continue;
+      }
+      if (!st.instance) {
+        await sleep(600);
+        continue;
+      }
+      try {
+        await pullLogs(true);
+        setLive("live");
+        backoff = 400;
+      } catch (_) {
+        setLive("offline");
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, 5000);
+      }
+    }
+  }
+
+  // 状态轮询：日志循环只管日志，这里只管实例状态，两者互不拖累。
   async function poll() {
     if (!st.instance) return;
     try {
-      const r = await api(`/api/instances/logs?id=${encodeURIComponent(st.instance.id)}&since=${st.since}`);
-      appendLogs(r.lines);
-      st.since = r.total || 0;
-
-      const changed = r.state !== st.instance.state
-        || r.port !== st.instance.actualPort
-        || r.url !== st.instance.url;
-      if (changed) {
-        st.instance.state = r.state;
-        st.instance.actualPort = r.port;
-        st.instance.url = r.url;
+      const list = await api("/api/instances");
+      const cur = (list || []).find((i) => i.id === st.instance.id);
+      if (cur) {
+        st.instance.state = cur.state;
+        st.instance.actualPort = cur.actualPort;
+        st.instance.url = cur.url;
         render();
       }
     } catch (_) { /* 下一轮重试 */ }
@@ -207,7 +284,10 @@
     st.backendUp = true;
     const it = list.find((i) => st.instance && i.id === st.instance.id) || list[0];
     if (it) {
-      if (!st.instance || st.instance.id !== it.id) st.since = 0;
+      if (!st.instance || st.instance.id !== it.id) {
+        st.since = 0;
+        st.localOffset = 0;
+      }
       st.instance = it;
     }
     // 只把「跟我同一个 profile」的外部 dsh 当成冲突；不同 profile 允许并存
@@ -227,6 +307,7 @@
         st.ready = true;
         setInterval(poll, 700);
         poll();
+        logLoop();          // 实时日志：长轮询，有输出立刻刷
         // 手动模式：打开启动器不自动拉起 dsh，由用户点「启动 DSHA」。
         // 只有用户显式在设置里勾了「打开启动器时自动启动」才会自动执行。
         if (AUTO_START) autoStart();
@@ -253,6 +334,7 @@
     await act(async () => {
       it.state = "starting";
       st.since = 0;
+      st.localOffset = 0;
       render();
       try {
         await api("/api/instances/start", { id: it.id });
@@ -326,6 +408,7 @@
       const target = currentId(); if (!target) return;
       it.state = "starting";
       st.since = 0;
+      st.localOffset = 0;
       render();
       await api("/api/instances/start", { id: target });
       toast("正在启动 " + it.name + "…");
@@ -335,12 +418,7 @@
   });
 
   $("stopButton").addEventListener("click", () => {
-    const it = st.instance;
     const target = currentId(); if (!target) return;
-    // 运行中停止才确认；启动中卡住了直接让停，别拦
-    if (it && it.state === "running" && !confirm(`确定停止 ${it.name} 吗？\n工作台会关闭，未保存的对话可能丢失。`)) {
-      return;
-    }
     act(async () => {
       stopWatch();
       await api("/api/instances/stop", { id: target });
@@ -376,6 +454,7 @@
       stopWatch();
       st.instance.state = "starting";
       st.since = 0;
+      st.localOffset = 0;
       render();
       await api("/api/instances/restart", { id: target });
       toast("正在重启…");
@@ -396,6 +475,7 @@
       stopWatch();
       st.instance.state = "starting";
       st.since = 0;
+      st.localOffset = 0;
       render();
       await api("/api/start-safe", { id: target });
       toast("安全启动：已跳过全部补丁");
@@ -456,6 +536,7 @@
 
   $("activityButton").addEventListener("click", () => {
     const box = $("logWindow");
+    st.autoScroll = true;
     box.scrollTop = box.scrollHeight;
     toast("已定位到最新日志");
   });
@@ -465,6 +546,30 @@
     toast("已回到日志开头");
   });
 
+  $("logPauseButton").addEventListener("click", () => {
+    st.paused = !st.paused;
+    $("logPauseButton").textContent = st.paused ? "继续" : "暂停";
+    setLive(st.paused ? "paused" : "live");
+    if (!st.paused) pullLogs(true).catch(() => {});
+    toast(st.paused ? "日志已暂停" : "日志已继续");
+  });
+
+  $("logClearButton").addEventListener("click", () => {
+    clearLogs();
+    toast("已清屏（后端日志保留）");
+  });
+
+  // 用户手动往上翻时暂停自动滚动，滑回底部再恢复
+  let scrollGuard = 0;
+  $("logWindow").addEventListener("scroll", () => {
+    clearTimeout(scrollGuard);
+    // 程序性滚动也会触发 scroll，稍等一帧再判定
+    scrollGuard = setTimeout(() => {
+      const box = $("logWindow");
+      st.autoScroll = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+    }, 60);
+  });
+
   $("themeButton").addEventListener("click", () => {
     document.body.classList.toggle("light");
     const light = document.body.classList.contains("light");
@@ -472,15 +577,27 @@
     toast(light ? "已切换浅色主题" : "已切换深色主题");
   });
 
+  // 「日志」标签页：把控制台日志区滚进来，不重复开窗口
+  document.querySelectorAll('.tab[data-tab="logs"]').forEach((b) => b.addEventListener("click", () => {
+    $("logWindow").scrollIntoView({ behavior: "smooth", block: "center" });
+  }));
+
   document.querySelectorAll(".modal-close").forEach((b) =>
     b.addEventListener("click", () => b.closest("dialog").close()));
 
   document.querySelectorAll(".nav-item").forEach((btn) => btn.addEventListener("click", () => {
     document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n === btn));
     const page = btn.dataset.page;
-    if (page === "dashboard") { $("pageTitle").textContent = "仪表盘"; $("environmentButton").click(); }
-    else if (page === "projects") { $("pageTitle").textContent = "项目"; toast("项目视图待接入"); }
-    else { $("pageTitle").textContent = "DSHA 控制中心"; }
+    if (page === "plugins") {
+      // 插件页：当前版本的补丁/扩展都写在启动日志里，直接把人送到那儿
+      $("pageTitle").textContent = "插件";
+      $("logWindow").scrollIntoView({ behavior: "smooth", block: "center" });
+    } else if (page === "settings") {
+      $("pageTitle").textContent = "设置";
+      $("settingsButton").click();
+    } else {
+      $("pageTitle").textContent = "DSHA 控制中心";
+    }
   }));
 
   const addBtn = $("addInstanceButton");

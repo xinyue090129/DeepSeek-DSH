@@ -78,6 +78,7 @@ public class Backend {
         transient String workbenchUrl = "";    // 带 token 的完整工作台地址
         transient Process proc;
         transient final List<String> logs = Collections.synchronizedList(new ArrayList<>());
+        transient int logDropped;              // 被裁掉的行数，用于校正前端下标
 
         int effectivePort() { return actualPort > 0 ? actualPort : port; }
 
@@ -323,17 +324,35 @@ public class Backend {
                         Instance t = find(q.get("id"));
                         int since = 0;
                         try { since = Integer.parseInt(q.getOrDefault("since", "0")); } catch (Exception ignored) {}
-                        if (t == null) { ok(ex, "{\"lines\":[],\"total\":0}"); return; }
+                        // wait=1：长轮询。有新日志立刻返回，没有就最多挂 2 秒再返回。
+                        // 前端据此做「实时」流，不必高频空转。
+                        boolean wait = "1".equals(q.get("wait"));
+                        if (t == null) { ok(ex, "{\"lines\":[],\"total\":0,\"offset\":0}"); return; }
+
+                        long deadline = System.currentTimeMillis() + 2000L;
+                        synchronized (t.logs) {
+                            while (wait && t.logs.size() <= since
+                                    && System.currentTimeMillis() < deadline) {
+                                try { t.logs.wait(Math.max(1L, deadline - System.currentTimeMillis())); }
+                                catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+                            }
+                        }
+
                         StringBuilder sb = new StringBuilder("{\"lines\":[");
                         int total;
+                        // offset = 本次首行在全量日志里的下标，前端用它做累计行数
+                        int offset;
                         synchronized (t.logs) {
                             total = t.logs.size();
-                            for (int k = Math.max(0, since); k < total; k++) {
-                                if (k > Math.max(0, since)) sb.append(',');
+                            offset = Math.min(Math.max(0, since), total);
+                            for (int k = offset; k < total; k++) {
+                                if (k > offset) sb.append(',');
                                 sb.append('"').append(esc(t.logs.get(k))).append('"');
                             }
                         }
                         sb.append("],\"total\":").append(total)
+                          .append(",\"offset\":").append(offset)
+                          .append(",\"dropped\":").append(t.logDropped)
                           .append(",\"state\":\"").append(t.state).append("\"")
                           .append(",\"port\":").append(t.effectivePort())
                           .append(",\"url\":\"").append(t.url()).append("\"}");
@@ -505,9 +524,12 @@ public class Backend {
             ProcessBuilder pb = new ProcessBuilder(real);
             pb.directory(new File(workDir));
             pb.redirectErrorStream(true);
+            // 关掉 Java 侧缓冲：dsh 不停输出时也能立刻看到日志
+            pb.redirectInput(ProcessBuilder.Redirect.PIPE);
             Map<String, String> env = pb.environment();
             env.put("PATH", mergedPath());
             env.put("NO_COLOR", "1");
+            env.put("FORCE_COLOR", "0");
             for (String line : i.envText.split("\\R")) {
                 int eq = line.indexOf('=');
                 if (eq > 0) env.put(line.substring(0, eq).trim(), line.substring(eq + 1).trim());
@@ -695,7 +717,12 @@ public class Backend {
         String line = "[" + LocalTime.now().format(TS) + "] " + msg;
         synchronized (i.logs) {
             i.logs.add(line);
-            while (i.logs.size() > MAX_LOG_LINES) i.logs.remove(0);
+            while (i.logs.size() > MAX_LOG_LINES) {
+                i.logs.remove(0);
+                i.logDropped++;
+            }
+            // 唤醒正在长轮询的请求，做到「有日志立刻推」
+            i.logs.notifyAll();
         }
     }
 
