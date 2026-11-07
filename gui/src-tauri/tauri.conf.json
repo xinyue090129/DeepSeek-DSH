@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DSHA",
+  "version": "1.0.0",
+  "identifier": "com.dshlauncher.app",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "DSHA · 控制中心",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1100,
+        "minHeight": 700,
+        "resizable": true,
+        "center": true,
+        "decorations": true,
+        "transparent": false,
+        "backgroundColor": "#080a0d"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; img-src 'self' data:; connect-src http://127.0.0.1:7080 http://127.0.0.1:7081 http://127.0.0.1:7082 http://127.0.0.1:7083 http://127.0.0.1:7084 http://127.0.0.1:7085 http://127.0.0.1:7086 http://127.0.0.1:7087 http://127.0.0.1:7088 http://127.0.0.1:7089"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "deb",
+      "appimage"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png"
+    ],
+    "category": "Development",
+    "shortDescription": "DeepSeek Harness 桌面管理器",
+    "longDescription": "管理 dsh 实例的启动、停止、日志与配置"
+  }
+}

@@ -1,0 +1,30 @@
+# ---- Rust / Tauri 构建产物 ----
+gui/src-tauri/target/
+gui/src-tauri/gen/schemas/
+
+# ---- Java 编译产物 ----
+backend/out/
+*.class
+
+# ---- 运行时产物（可重新构建）----
+backend/dsh-backend.jar
+gui/src-tauri/target/release/dsh-launcher
+
+# ---- 崩溃日志 / 临时文件 ----
+hs_err_pid*.log
+replay_pid*.log
+core.[0-9]*
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.Trash-*/
+.workbuddy/
+
+# ---- 本地临时验证脚本 ----
+.probe*/
+.t*.py
+.fakedsh

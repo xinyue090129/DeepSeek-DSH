@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=DSHA
+Name[zh_CN]=DSHA 控制中心
+Comment=DSH 桌面控制中心
+Comment[en]=DeepSeek Harness instance manager
+Exec=/mnt/bcache/dsh-launcher/dsh-launcher.sh
+Path=/mnt/bcache/dsh-launcher
+Icon=/mnt/bcache/dsh-launcher/dsh-launcher.png
+Terminal=false
+Categories=Development;
+StartupNotify=true
+StartupWMClass=Dsh-launcher

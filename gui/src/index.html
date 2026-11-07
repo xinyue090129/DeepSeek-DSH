@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#090b0e">
+  <title>DSHA · 控制中心</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark"><span class="terminal-glyph">›_</span></div>
+        <span class="brand-name">DSHA</span>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-button" id="activityButton" title="活动"><span class="list-glyph">☷</span></button>
+        <button class="icon-button theme-toggle" id="themeButton" title="切换主题"><span>◐</span></button>
+        <button class="icon-button info-button" id="aboutButton" title="关于"><span>ⓘ</span></button>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <nav class="nav-list" aria-label="主导航">
+        <button class="nav-item active" data-page="overview"><span class="nav-icon">◈</span><span>DSHA</span></button>
+        <button class="nav-item" data-page="dashboard"><span class="nav-icon">⌕</span><span>仪表盘</span></button>
+        <button class="nav-item" data-page="projects"><span class="nav-icon">♙</span><span>项目</span></button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="sidebar-version">DSHA Desktop <span>UI Preview</span></div>
+        <button class="sidebar-link" id="settingsButton"><span>⚙</span> 设置</button>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <div class="page-heading">
+        <div>
+          <p class="eyebrow">CONTROL CENTER</p>
+          <h1 id="pageTitle">DSHA 控制中心</h1>
+        </div>
+        <div class="heading-status"><span class="status-dot stopped"></span><span id="headerStatus">未运行</span></div>
+      </div>
+
+      <div class="dashboard-grid">
+        <section class="left-column">
+          <article class="panel hero-panel">
+            <div class="hero-top">
+              <div class="state-orb"><span class="status-dot stopped"></span></div>
+              <div class="hero-copy">
+                <h2 id="instanceTitle">DSH 未运行</h2>
+                <p id="instanceSubtitle">随时开始你的下一项任务。</p>
+              </div>
+            </div>
+            <button class="primary-button" id="startButton"><span class="play-icon">▶</span><span>启动 DSHA</span></button>
+            <div class="button-row">
+              <button class="secondary-button" id="restartButton"><span class="button-symbol">↻</span>重启</button>
+              <button class="secondary-button" id="stopButton"><span class="button-symbol">□</span>停止</button>
+            </div>
+          </article>
+
+          <div class="metric-grid">
+            <article class="panel metric-card">
+              <div class="metric-value" id="portValue">—</div>
+              <div class="metric-label">实验 Web 端口</div>
+            </article>
+            <article class="panel metric-card">
+              <div class="metric-value" id="runtimeValue">READY</div>
+              <div class="metric-label">运行环境</div>
+            </article>
+          </div>
+
+          <section class="quick-section">
+            <div class="section-heading"><h3>快捷入口</h3><span>QUICK ACCESS</span></div>
+            <button class="panel link-card" id="addressButton">
+              <span class="link-icon">↗</span>
+              <span class="link-card-copy"><strong>访问地址</strong><small id="addressHint">启动后可直接进入工作台</small></span>
+              <span class="chevron">›</span>
+            </button>
+          </section>
+
+          <section class="panel lower-panel">
+            <div class="section-heading"><h3>实例管理</h3><button class="text-button" id="addInstanceButton">＋ 添加实例</button></div>
+            <div class="instance-row">
+              <span class="instance-avatar">D</span>
+              <span class="instance-details"><strong>默认实例</strong><small>本地运行环境 · Linux</small></span>
+              <span class="instance-state"><i class="status-dot stopped"></i>已停止</span>
+              <button class="more-button" title="更多">···</button>
+            </div>
+          </section>
+        </section>
+
+        <section class="right-column">
+          <button class="panel readiness-card" id="webPanel">
+            <span class="readiness-copy"><strong id="webState">READY</strong><small>实验 Web 端口</small></span>
+            <span class="chevron">›</span>
+          </button>
+          <button class="panel environment-card" id="environmentButton">
+            <span class="link-icon">↗</span>
+            <span class="environment-copy"><strong>运行环境</strong><small id="envHint">检测 dsh / node / npm</small></span>
+            <span class="chevron">›</span>
+          </button>
+
+          <section class="logs-section">
+            <div class="logs-heading"><h3>启动日志</h3><button class="text-button" id="logsTabButton">回到顶部</button></div>
+            <div class="log-window" id="logWindow" aria-live="polite">
+              <div class="log-line muted">等待启动…</div>
+            </div>
+          </section>
+
+          <div class="bottom-actions">
+            <button class="secondary-button" id="safeStartButton">安全启动</button>
+            <button class="secondary-button" id="recoveryButton">恢复选项</button>
+          </div>
+        </section>
+      </div>
+
+      <section class="tabs-panel panel">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="overview">概览</button>
+          <button class="tab" data-tab="instances">实例</button>
+          <button class="tab" data-tab="logs">日志</button>
+          <button class="tab" data-tab="settings">设置</button>
+        </div>
+        <div class="tab-content" id="tabContent">DSHA 桌面控制中心已就绪。</div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status"></div>
+  <dialog class="modal" id="settingsModal">
+    <form method="dialog">
+      <div class="modal-heading"><div><p class="eyebrow">PREFERENCES</p><h2>设置</h2></div><button class="modal-close" aria-label="关闭">×</button></div>
+
+      <label class="setting-row"><span><strong>Web 端口</strong><small>dsh 工作台监听的端口，留空或开启「自动」则由系统分配</small></span>
+        <input class="port-input" id="setPort" type="number" min="1024" max="65535" placeholder="3080">
+      </label>
+      <label class="setting-row"><span><strong>自动分配端口</strong><small>被占用时自动换一个空闲端口，避免启动失败</small></span><input type="checkbox" id="setAutoPort"></label>
+      <label class="setting-row"><span><strong>端口冲突时自动回退</strong><small>固定端口被占用时，自动改用随机端口</small></span><input type="checkbox" id="setFallback" checked></label>
+      <label class="setting-row"><span><strong>打开启动器时自动启动</strong><small>默认关闭，由你手动点「启动 DSHA」；勾选后启动器一打开就在后台拉起 dsh</small></span><input type="checkbox" id="setAutoStart"></label>
+      <label class="setting-row"><span><strong>就绪后自动进入工作台</strong><small>dsh 一就绪就在应用内新窗口打开带 token 的工作台，不弹外部浏览器</small></span><input type="checkbox" id="setAutoOpen" checked></label>
+      <button class="primary-button modal-save" value="save" id="settingsSaveBtn">保存设置</button>
+      <p class="modal-footnote" id="portCheckNote"></p>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="aboutModal">
+    <form method="dialog">
+      <div class="modal-heading"><div><p class="eyebrow">ABOUT</p><h2>关于 DSHA</h2></div><button class="modal-close" aria-label="关闭">×</button></div>
+      <p class="about-text">DSHA Linux 桌面控制中心<br><span id="aboutVersion">Tauri + Java 后端</span></p>
+      <p class="modal-footnote">界面由 Tauri(WebKit) 渲染，业务逻辑运行在独立的 Java 后端进程中。</p>
+      <button class="secondary-button modal-save">关闭</button>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
