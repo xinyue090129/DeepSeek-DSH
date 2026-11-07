@@ -585,18 +585,29 @@
   document.querySelectorAll(".modal-close").forEach((b) =>
     b.addEventListener("click", () => b.closest("dialog").close()));
 
+  // 弹窗打开时锁住背景滚动：否则在插件页滚轮会带着底下的列表一起跑。
+  // 用 close 事件统一收尾，覆盖 Esc、关闭按钮、form method=dialog 所有关闭路径。
+  document.querySelectorAll("dialog").forEach((d) => {
+    d.addEventListener("close", () => {
+      if (!document.querySelector("dialog[open]")) document.body.classList.remove("modal-open");
+    });
+  });
+  const _showModal = HTMLDialogElement.prototype.showModal;
+  HTMLDialogElement.prototype.showModal = function () {
+    document.body.classList.add("modal-open");
+    return _showModal.call(this);
+  };
+
   document.querySelectorAll(".nav-item").forEach((btn) => btn.addEventListener("click", () => {
-    document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n === btn));
     const page = btn.dataset.page;
     if (page === "plugins") {
-      // 插件页：当前版本的补丁/扩展都写在启动日志里，直接把人送到那儿
-      $("pageTitle").textContent = "插件";
-      $("logWindow").scrollIntoView({ behavior: "smooth", block: "center" });
+      showView("plugins");
+      loadPlugins();
     } else if (page === "settings") {
-      $("pageTitle").textContent = "设置";
+      showView("console");
       $("settingsButton").click();
     } else {
-      $("pageTitle").textContent = "DSHA 控制中心";
+      showView("console");
     }
   }));
 
@@ -607,6 +618,418 @@
       toast("已新增实例，共 " + list.length + " 个");
       await refresh();
     } catch (e) { toast("添加失败：" + e.message); }
+  });
+
+
+  // =====================================================================
+  //  插件页
+  //  数据来自后端 /api/plugins：真实读取 profile 的 package.json、
+  //  node_modules 里的包清单和补丁里的 disabled 标记。
+  //  红线：启动器只读插件清单，永不安装 / 升级 / 卸载 / 启停插件。
+  //  所有写入口在后端都被显式拒绝（见 Backend 的 READ_GUARD），
+  //  界面上也不提供任何能触发写入的按钮 —— 见 docs/CHANGELOG.md。
+  // =====================================================================
+  const plug = {
+    items: [],
+    available: [],
+    loaded: false,
+    loading: false,
+    marketScope: "all",
+    filter: "all",
+    query: "",
+    profile: "",
+    writable: false
+  };
+
+  const SPEC_LABEL = {
+    npm: "npm", github: "GitHub", archive: "压缩包",
+    local: "本地路径", workspace: "workspace", profile: "profile"
+  };
+
+  function showView(which) {
+    $("consoleView").hidden = which !== "console";
+    $("pluginView").hidden = which !== "plugins";
+    document.querySelectorAll(".nav-item").forEach((n) => {
+      const p = n.dataset.page;
+      n.classList.toggle("active",
+        (which === "plugins" && p === "plugins") || (which === "console" && p === "overview"));
+    });
+  }
+
+  function pluginLogo(name) {
+    const base = name.split("/").pop() || name;
+    return base.replace(/^dsh-/, "").slice(0, 1).toUpperCase() || "?";
+  }
+
+  function pluginCard(p) {
+    const card = document.createElement("article");
+    card.className = "plugin-card";
+
+    const logo = document.createElement("div");
+    logo.className = "plugin-logo" + (p.official ? " official" : "");
+    logo.textContent = pluginLogo(p.name);
+
+    const body = document.createElement("div");
+    body.className = "plugin-body";
+
+    const title = document.createElement("div");
+    title.className = "plugin-title";
+    const nm = document.createElement("span");
+    nm.className = "plugin-name";
+    nm.textContent = p.name;
+    title.appendChild(nm);
+    if (p.version) {
+      const v = document.createElement("span");
+      v.className = "plugin-version";
+      v.textContent = "v" + p.version;
+      title.appendChild(v);
+    }
+
+    const desc = document.createElement("div");
+    desc.className = "plugin-desc";
+    desc.textContent = p.description || "（该包未提供 description）";
+
+    const tags = document.createElement("div");
+    tags.className = "plugin-tags";
+    const t1 = document.createElement("span");
+    t1.className = "tag" + (p.official ? " official" : "");
+    t1.textContent = p.official ? "官方内置" : "第三方";
+    tags.appendChild(t1);
+
+    if (p.bundle) {
+      const t2 = document.createElement("span");
+      t2.className = "tag";
+      t2.textContent = "已装载";
+      tags.appendChild(t2);
+    }
+    const t3 = document.createElement("span");
+    t3.className = "tag " + (p.enabled ? "ok" : "off");
+    t3.textContent = p.enabled ? "已启用" : "补丁禁用";
+    tags.appendChild(t3);
+
+    if (p.spec) {
+      const t4 = document.createElement("span");
+      t4.className = "tag";
+      t4.textContent = (SPEC_LABEL[p.source] || p.source) + " · " + p.spec;
+      tags.appendChild(t4);
+    }
+
+    body.append(title, desc, tags);
+
+    const ctrl = document.createElement("div");
+    ctrl.className = "plugin-ctrl";
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.className = "toggle";
+    toggle.checked = !!p.enabled;
+    toggle.title = p.enabled
+      ? "已启用，点击可禁用（仅改 cordis.patch.yml，不卸载）"
+      : "已禁用，点击可启用";
+    // 只在用户拖动时写一次 cordis.patch.yml；任何自动流程都不会触发
+    toggle.addEventListener("change", async () => {
+      const want = toggle.checked;
+      toggle.disabled = true;
+      try {
+        const r = await api("/api/plugins/toggle", {
+          name: p.name, enabled: want,
+          profile: plug.profile || st.instance?.profile || "web",
+          id: st.instance?.id,
+        });
+        if (r.ok) {
+          p.enabled = want;
+          toast((want ? "已启用 " : "已禁用 ") + p.name + "，重启实例生效");
+        } else {
+          toggle.checked = !want;
+          toast("切换失败" + (r.error ? "：" + r.error : ""));
+        }
+      } catch (err) {
+        toggle.checked = !want;
+        toast("切换失败：" + err.message);
+      } finally {
+        toggle.disabled = false;
+      }
+    });
+    ctrl.appendChild(toggle);
+
+    card.append(logo, body, ctrl);
+    return card;
+  }
+
+  function renderPlugins() {
+    const all = plug.items || [];
+    const q = plug.query.trim().toLowerCase();
+
+    // 市场页：按来源范围筛
+    const marketList = $("marketList");
+    const marketItems = all.filter((p) => {
+      if (plug.marketScope === "external" && p.official) return false;
+      if (plug.marketScope === "official" && !p.official) return false;
+      return true;
+    });
+    marketList.replaceChildren();
+    if (!marketItems.length) {
+      const d = document.createElement("div");
+      d.className = "plugin-empty";
+      d.textContent = plug.loading ? "读取中…" : "当前 profile 没有装载插件";
+      marketList.appendChild(d);
+    } else {
+      marketItems.forEach((p) => marketList.appendChild(pluginCard(p)));
+    }
+    $("installedCount").textContent = marketItems.length;
+
+    // 官方可选扩展：随 dsh 分发但本 profile 没装载的能力包
+    const avail = plug.available || [];
+    const availList = $("availableList");
+    availList.replaceChildren();
+    if (!avail.length) {
+      const d = document.createElement("div");
+      d.className = "plugin-empty";
+      d.textContent = plug.loading ? "读取中…" : "没有发现未装载的官方扩展";
+      availList.appendChild(d);
+    } else {
+      avail.forEach((a) => {
+        const card = document.createElement("article");
+        card.className = "plugin-card";
+
+        const logo = document.createElement("div");
+        logo.className = "plugin-logo official";
+        logo.textContent = (a.name.split("/").pop() || "?")
+          .replace(/^dsh-/, "").replace(/-bundle$/, "").slice(0, 1).toUpperCase();
+
+        const body = document.createElement("div");
+        body.className = "plugin-body";
+        const title = document.createElement("div");
+        title.className = "plugin-title";
+        const nm = document.createElement("span");
+        nm.className = "plugin-name";
+        nm.textContent = a.name;
+        title.appendChild(nm);
+        if (a.version) {
+          const v = document.createElement("span");
+          v.className = "plugin-version";
+          v.textContent = "v" + a.version;
+          title.appendChild(v);
+        }
+        const desc = document.createElement("div");
+        desc.className = "plugin-desc";
+        desc.textContent = a.description || "（该包未提供 description）";
+        body.append(title, desc);
+
+        const ctrl = document.createElement("div");
+        ctrl.className = "plugin-ctrl";
+        const badge = document.createElement("span");
+        badge.className = "tag off";
+        badge.textContent = "未装载";
+        ctrl.appendChild(badge);
+
+        card.append(logo, body, ctrl);
+        availList.appendChild(card);
+      });
+    }
+    $("availableCount").textContent = avail.length;
+
+    // 管理页：搜索 + 状态筛选
+    const listItems = all.filter((p) => {
+      if (q && !(p.name + " " + (p.description || "")).toLowerCase().includes(q)) return false;
+      if (plug.filter === "enabled") return p.enabled;
+      if (plug.filter === "disabled") return !p.enabled;
+      if (plug.filter === "official") return p.official;
+      return true;
+    });
+    const list = $("pluginList");
+    list.replaceChildren();
+    listItems.forEach((p) => list.appendChild(pluginCard(p)));
+    $("pluginEmpty").hidden = listItems.length !== 0;
+
+    $("pluginTotal").textContent = all.length;
+    $("pluginEnabledCount").textContent = all.filter((p) => p.enabled).length;
+    $("allCount").textContent = all.length;
+
+    $("manageFootnote").textContent = plug.profile
+      ? `数据来源：profile「${plug.profile}」的 package.json 与 node_modules 实际清单，共 ${all.length} 项。启停写操作待后端接口开放。`
+      : "插件清单来自当前 profile 的 package.json 与已安装依赖。";
+  }
+
+  async function loadPlugins(force) {
+    if (plug.loading) return;
+    if (plug.loaded && !force) return;
+    plug.loading = true;
+    $("manageFootnote").textContent = "正在读取插件清单…";
+    try {
+      const it = st.instance;
+      const q = it ? `?id=${encodeURIComponent(it.id)}` : "";
+      const r = await api("/api/plugins" + q);
+      plug.items = Array.isArray(r.items) ? r.items : [];
+      plug.profile = r.profile || "";
+      plug.writable = !!r.writable;
+      plug.available = Array.isArray(r.availableItems) ? r.availableItems : [];
+      plug.loaded = true;
+    } catch (e) {
+      plug.items = [];
+      $("manageFootnote").textContent = "读取失败：" + (e.message || e);
+    } finally {
+      plug.loading = false;
+      renderPlugins();
+    }
+  }
+
+  // ---- 市场 / 管理 切换 ----
+  document.querySelectorAll(".segment").forEach((b) => b.addEventListener("click", () => {
+    const v = b.dataset.view;
+    document.querySelectorAll(".segment").forEach((x) => x.classList.toggle("active", x === b));
+    $("marketPane").classList.toggle("active", v === "market");
+    $("managePane").classList.toggle("active", v === "manage");
+  }));
+
+  // ---- 市场来源筛选 ----
+  $("marketChips").addEventListener("click", (e) => {
+    const b = e.target.closest(".chip");
+    if (!b) return;
+    plug.marketScope = b.dataset.scope;
+    $("marketChips").querySelectorAll(".chip").forEach((x) => x.classList.toggle("active", x === b));
+    renderPlugins();
+  });
+
+  // ---- 管理页筛选与搜索 ----
+  document.querySelectorAll('#managePane .chip').forEach((b) => b.addEventListener("click", () => {
+    plug.filter = b.dataset.filter;
+    document.querySelectorAll('#managePane .chip').forEach((x) => x.classList.toggle("active", x === b));
+    renderPlugins();
+  }));
+  $("pluginSearch").addEventListener("input", (e) => {
+    plug.query = e.target.value;
+    renderPlugins();
+  });
+  $("reloadPlugins").addEventListener("click", () => loadPlugins(true));
+
+  // ---- 从链接安装：只在用户点「确认安装」后调用一次后端接口 ----
+  // 启动器任何自动流程（启动 / 重启 / 轮询 / 环境检测）都不会调用该接口。
+  const pluginSource = $("pluginSource");
+  let pendingSpec = "";
+
+  pluginSource.addEventListener("input", () => {
+    const has = !!pluginSource.value.trim();
+    $("parseButton").disabled = !has;
+    $("clearSource").classList.toggle("show", has);
+  });
+  $("clearSource").addEventListener("click", () => {
+    pluginSource.value = "";
+    pluginSource.dispatchEvent(new Event("input"));
+    pluginSource.focus();
+  });
+
+  $("parseButton").addEventListener("click", () => {
+    const v = pluginSource.value.trim();
+    if (!v) return;
+    pendingSpec = v;
+    $("candidateName").textContent = specBasename(v) || v;
+    $("candidateSource").textContent = v;
+    $("trustCheck").checked = false;
+    $("confirmInstall").disabled = true;
+    $("confirmInstall").textContent = "确认安装";
+    $("installNote").textContent = "点「确认安装」后才会执行一次 pnpm add，失败会自动回滚 package.json。";
+    $("installModal").showModal();
+  });
+
+  $("trustCheck").addEventListener("change", (e) => {
+    $("confirmInstall").disabled = !e.target.checked;
+  });
+
+  $("installForm").addEventListener("submit", async (e) => {
+    if (!e.submitter || e.submitter.id !== "confirmInstall") return;
+    e.preventDefault();
+    if (!pendingSpec) return;
+
+    const btn = $("confirmInstall");
+    btn.disabled = true;
+    btn.textContent = "安装中…";
+    $("installNote").textContent = "正在执行 pnpm add，详见控制台日志…";
+
+    try {
+      const r = await api("/api/plugins/install", {
+        spec: pendingSpec,
+        profile: plug.profile || st.instance?.profile || "web",
+        registry: $("sourceSelect").value,
+        id: st.instance?.id,
+      });
+      if (r.ok) {
+        $("installNote").textContent = "安装成功，重启实例后生效。";
+        toast("已安装 " + pendingSpec + "，重启实例生效");
+        setTimeout(() => $("installModal").close(), 900);
+        loadPlugins(true);
+      } else {
+        $("installNote").textContent = "安装失败" + (r.rolledBack ? "，已回滚 package.json" : "")
+          + (r.error ? "：" + r.error : "") + "。详见控制台日志。";
+        toast("安装失败，见控制台日志");
+      }
+    } catch (err) {
+      $("installNote").textContent = "安装请求失败：" + err.message;
+      toast("安装请求失败");
+    } finally {
+      btn.textContent = "确认安装";
+      btn.disabled = !$("trustCheck").checked;
+    }
+  });
+
+  $("sourceSelect").addEventListener("change", (e) => {
+    const label = e.target.options[e.target.selectedIndex].textContent;
+    toast("下载源：" + label);
+  });  $("pasteButton").addEventListener("click", async () => {
+    try {
+      pluginSource.value = await navigator.clipboard.readText();
+      pluginSource.dispatchEvent(new Event("input"));
+      toast("已粘贴");
+    } catch (_) {
+      pluginSource.focus();
+      toast("请用 Ctrl+V 粘贴");
+    }
+  });
+
+  function specBasename(s) {
+    return s.trim().replace(/\/+$/, "").split("/").pop().replace(/\.git$/, "");
+  }
+
+  $("parseButton").addEventListener("click", () => {
+    const v = pluginSource.value.trim();
+    if (!v) return;
+    $("candidateName").textContent = specBasename(v) || v;
+    $("candidateSource").textContent = v;
+    $("installNote").textContent = "启动器只读：不会安装、不会写入 profile、不会调用 npm / pnpm。";
+    $("installModal").showModal();
+  });
+  // 弹窗里唯一的动作是把来源复制出来，方便去 dsh 自带的插件管理界面粘贴
+  $("installForm").addEventListener("submit", async (e) => {
+    if (!e.submitter || e.submitter.id !== "copySpec") return;
+    e.preventDefault();
+    const spec = ($("candidateSource").textContent || "").trim();
+    $("installModal").close();
+    if (!spec) return;
+    try {
+      await navigator.clipboard.writeText(spec);
+      toast("已复制来源，可粘贴到 dsh 插件管理界面");
+    } catch (_) {
+      toast("复制失败，请手动选中来源复制");
+    }
+  });
+
+  $("sourceSelect").addEventListener("change", (e) => {
+    const label = e.target.options[e.target.selectedIndex].textContent;
+    toast("已记录下载源：" + label + "（启动器不下载任何内容）");
+  });
+
+  // ---- 导入 / 导出 / 社区：启动器只读，不参与插件增删 ----
+  // 隐藏文件选择器本身仍保留在 DOM，但选择后不做任何写入。
+  $("importButton").addEventListener("click", () => $("pluginFile").click());
+  $("pluginFile").addEventListener("change", (e) => {
+    const f = e.target.files[0];
+    if (f) toast("已选择 " + f.name + "；启动器不导入插件，请用 dsh 自带的插件管理界面");
+    e.target.value = "";
+  });
+  $("exportButton").addEventListener("click", () => {
+    toast("启动器只读插件清单，不导出、不打包插件");
+  });
+  $("communityButton").addEventListener("click", () => {
+    toast("社区插件源需在 dsh 自带插件管理界面浏览");
   });
 
   // ---------------------------------------------------------------- 设置

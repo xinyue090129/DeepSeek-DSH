@@ -34,6 +34,8 @@
     </aside>
 
     <main class="main-content">
+      <!-- ============ 控制中心视图 ============ -->
+      <div class="view" id="consoleView">
       <div class="page-heading">
         <div>
           <p class="eyebrow">CONTROL CENTER</p>
@@ -131,6 +133,119 @@
         </div>
         <div class="tab-content" id="tabContent">DSHA 桌面控制中心已就绪。</div>
       </section>
+      </div><!-- /consoleView -->
+
+      <!-- ============ 插件视图 ============ -->
+      <div class="view" id="pluginView" hidden>
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">EXTENSIONS</p>
+            <h1>插件</h1>
+          </div>
+          <div class="heading-status"><span class="plugin-count-badge"><b id="pluginTotal">—</b> 个插件</span></div>
+        </div>
+
+        <div class="segmented" role="tablist">
+          <button class="segment active" data-view="market">插件市场</button>
+          <button class="segment" data-view="manage">插件管理 <span class="segment-count" id="pluginEnabledCount">—</span></button>
+        </div>
+
+        <!-- 插件市场 -->
+        <section class="plugin-pane active" id="marketPane">
+          <div class="market-grid">
+            <section class="panel install-card">
+              <div class="section-heading"><h3>从链接安装</h3><span>INSTALL</span></div>
+              <label class="field-label" for="pluginSource">仓库、npm 包名或压缩包直链</label>
+              <div class="source-field">
+                <span class="source-icon">↗</span>
+                <input id="pluginSource" type="text" placeholder="例如 dsh-code-checker 或 https://github.com/…" autocomplete="off" spellcheck="false">
+                <button class="clear-input" id="clearSource" title="清空" aria-label="清空">×</button>
+              </div>
+              <p class="hint">支持 GitHub 仓库、分支或子目录、Release 下载地址，以及 npm 包名。</p>
+              <div class="install-actions">
+                <button class="secondary-button compact" id="pasteButton"><span class="button-symbol">▣</span>粘贴</button>
+                <button class="primary-button compact" id="parseButton" disabled>解析安装</button>
+              </div>
+              <p class="hint dim">启动器不会自动安装任何插件，只在你点击「确认安装」后执行一次。</p>
+              <div class="source-select">
+                <span>下载源</span>
+                <select id="sourceSelect" aria-label="下载源">
+                  <option value="auto">自动选择（推荐）</option>
+                  <option value="npm">npm 官方源</option>
+                  <option value="mirror">npmmirror 镜像</option>
+                </select>
+              </div>
+            </section>
+
+            <div class="market-side">
+              <button class="panel action-tile" id="communityButton">
+                <span class="tile-icon">⌘</span>
+                <span class="tile-copy"><strong>社区插件生态</strong><small>浏览社区插件与安装来源</small></span>
+                <span class="chevron">›</span>
+              </button>
+              <button class="panel action-tile" id="importButton">
+                <span class="tile-icon">⇩</span>
+                <span class="tile-copy"><strong>导入插件包</strong><small>从本地选择 ZIP / TAR</small></span>
+                <span class="chevron">›</span>
+              </button>
+              <button class="panel action-tile" id="exportButton">
+                <span class="tile-icon">⇧</span>
+                <span class="tile-copy"><strong>导出插件</strong><small>保存已安装插件的副本</small></span>
+                <span class="chevron">›</span>
+              </button>
+              <input type="file" id="pluginFile" accept=".zip,.tgz,.tar,.gz" hidden>
+              <p class="security-note"><span>ⓘ</span> 第三方插件以当前用户权限执行代码。安装前请确认来源可信。</p>
+            </div>
+          </div>
+
+          <section class="panel installed-card">
+            <div class="section-heading">
+              <h3>当前 profile 已装载 <span class="sub-count" id="installedCount">—</span></h3>
+              <span>LOADED PLUGINS</span>
+            </div>
+            <div class="chip-row" id="marketChips">
+              <button class="chip active" data-scope="all">全部</button>
+              <button class="chip" data-scope="external">第三方</button>
+              <button class="chip" data-scope="official">官方</button>
+            </div>
+            <div class="plugin-list compact-list" id="marketList">
+              <div class="plugin-empty">读取中…</div>
+            </div>
+          </section>
+
+          <section class="panel installed-card">
+            <div class="section-heading">
+              <h3>官方可选扩展 <span class="sub-count" id="availableCount">—</span></h3>
+              <span>AVAILABLE</span>
+            </div>
+            <p class="available-note">随 dsh 一起分发、当前 profile 未装载的官方能力包。此处只做展示，安装需在 dsh 侧操作。</p>
+            <div class="plugin-list compact-list" id="availableList">
+              <div class="plugin-empty">读取中…</div>
+            </div>
+          </section>
+        </section>
+
+        <!-- 插件管理 -->
+        <section class="plugin-pane" id="managePane">
+          <div class="manage-toolbar">
+            <div class="searchbox"><span>⌕</span><input id="pluginSearch" placeholder="搜索插件名称或描述"></div>
+            <button class="secondary-button compact" id="reloadPlugins">↻ 刷新</button>
+          </div>
+          <div class="chip-row">
+            <button class="chip active" data-filter="all">全部 <i id="allCount">—</i></button>
+            <button class="chip" data-filter="enabled">已启用</button>
+            <button class="chip" data-filter="disabled">已停用</button>
+            <button class="chip" data-filter="official">官方内置</button>
+          </div>
+          <div class="plugin-list" id="pluginList">
+            <div class="plugin-empty">读取中…</div>
+          </div>
+          <div class="plugin-empty-box" id="pluginEmpty" hidden>
+            <span>⌕</span><strong>没有匹配的插件</strong><small>换个关键词或筛选条件试试</small>
+          </div>
+          <p class="manage-footnote" id="manageFootnote">插件清单来自当前 profile 的 package.json 与已安装依赖。</p>
+        </section>
+      </div><!-- /pluginView -->
     </main>
   </div>
 
@@ -148,6 +263,23 @@
       <label class="setting-row"><span><strong>就绪后自动进入工作台</strong><small>dsh 一就绪就在应用内新窗口打开带 token 的工作台，不弹外部浏览器</small></span><input type="checkbox" id="setAutoOpen" checked></label>
       <button class="primary-button modal-save" value="save" id="settingsSaveBtn">保存设置</button>
       <p class="modal-footnote" id="portCheckNote"></p>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="installModal">
+    <form method="dialog" id="installForm">
+      <div class="modal-heading"><div><p class="eyebrow">PLUGIN INSTALLER</p><h2>确认安装</h2></div><button class="modal-close" value="cancel" aria-label="关闭">×</button></div>
+      <div class="candidate-row">
+        <div class="candidate-icon">⌘</div>
+        <div class="candidate-copy"><strong id="candidateName">插件来源</strong><small id="candidateSource"></small></div>
+      </div>
+      <div class="warning-box"><strong>安全提示</strong><p>插件可能执行安装脚本、访问网络并读取当前用户可访问的文件。请只安装你信任的来源。</p></div>
+      <label class="check-line"><input type="checkbox" id="trustCheck"> 我已确认来源可信，继续安装</label>
+      <div class="button-row">
+        <button class="secondary-button compact" value="cancel">取消</button>
+        <button class="primary-button compact" id="confirmInstall" value="confirm" disabled>确认安装</button>
+      </div>
+      <p class="modal-footnote" id="installNote"></p>
     </form>
   </dialog>
 

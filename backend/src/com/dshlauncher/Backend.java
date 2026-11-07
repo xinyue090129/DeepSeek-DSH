@@ -24,6 +24,13 @@ import java.util.regex.*;
  *
  * 安全红线：只启动、只检测、只聚焦；从不 kill 任何非本进程派生的子进程。
  *
+ * 插件原则：**不自动安装，只在用户显式请求时安装**。
+ *   - 启动、重启、轮询、环境检测等一切自动流程都不碰 npm / pnpm，
+ *     不写 profile 的 package.json，不发起任何插件下载；
+ *   - /api/plugins 只读磁盘上的既有清单，供界面展示；
+ *   - 只有 POST /api/plugins/install 才会真正执行安装，且必须由用户在界面上
+ *     点击触发（前端不做任何自动调用），失败会回滚 package.json。
+ *
  * 接口：
  *   GET  /api/health                健康检查 + 版本
  *   GET  /api/instances             实例列表
@@ -201,6 +208,59 @@ public class Backend {
                 }
 
                 switch (path) {
+                    // 插件安装 / 卸载：只响应用户的显式请求，绝不由启动流程自动调用。
+                    // 参数：{"spec":"包名或仓库","profile":"web","registry":"npm|mirror","enabled":true}
+                    case "/api/plugins/install": {
+                        Map<String, String> d = flatJson(body);
+                        String spec = d.getOrDefault("spec", "").trim();
+                        if (spec.isEmpty()) {
+                            ok(ex, "{\"ok\":false,\"error\":\"spec 不能为空\"}");
+                            return;
+                        }
+                        Instance t = d.containsKey("id") ? find(d.get("id"))
+                                : (inst.isEmpty() ? null : inst.get(0));
+                        String prof = d.containsKey("profile") && !d.get("profile").isBlank()
+                                ? d.get("profile")
+                                : (t != null ? t.profile : "web");
+                        String registry = d.getOrDefault("registry", "auto");
+                        ok(ex, pluginInstall(spec, prof, registry, t));
+                        return;
+                    }
+
+                    case "/api/plugins/uninstall": {
+                        Map<String, String> d = flatJson(body);
+                        String name = d.getOrDefault("name", "").trim();
+                        if (name.isEmpty()) {
+                            ok(ex, "{\"ok\":false,\"error\":\"name 不能为空\"}");
+                            return;
+                        }
+                        Instance t = d.containsKey("id") ? find(d.get("id"))
+                                : (inst.isEmpty() ? null : inst.get(0));
+                        String prof = d.containsKey("profile") && !d.get("profile").isBlank()
+                                ? d.get("profile")
+                                : (t != null ? t.profile : "web");
+                        ok(ex, pluginUninstall(name, prof, t));
+                        return;
+                    }
+
+                    // 启停：只改 cordis.patch.yml 的 disabled 标记，不动 node_modules
+                    case "/api/plugins/toggle": {
+                        Map<String, String> d = flatJson(body);
+                        String name = d.getOrDefault("name", "").trim();
+                        boolean enabled = "true".equals(d.getOrDefault("enabled", "false"));
+                        if (name.isEmpty()) {
+                            ok(ex, "{\"ok\":false,\"error\":\"name 不能为空\"}");
+                            return;
+                        }
+                        Instance t = d.containsKey("id") ? find(d.get("id"))
+                                : (inst.isEmpty() ? null : inst.get(0));
+                        String prof = d.containsKey("profile") && !d.get("profile").isBlank()
+                                ? d.get("profile")
+                                : (t != null ? t.profile : "web");
+                        ok(ex, pluginToggle(name, prof, enabled, t));
+                        return;
+                    }
+
                     case "/api/health": {
                         List<String[]> foreign = findForeignDsh(null);
                         StringBuilder fb = new StringBuilder("[");
@@ -213,6 +273,7 @@ public class Backend {
                         fb.append(']');
                         ok(ex, "{\"ok\":true,\"name\":\"dsh-backend\",\"version\":\"1.0.0\","
                                 + "\"instances\":" + inst.size()
+                                + ",\"pluginAutoInstall\":false"
                                 + ",\"instanceProfile\":\"" + esc(inst.isEmpty() ? "" : inst.get(0).profile) + "\""
                                 + ",\"foreignDsh\":" + fb + "}");
                         return;
@@ -386,6 +447,19 @@ public class Backend {
                     case "/api/env":
                         ok(ex, envJson());
                         return;
+
+                    // 插件清单：只读。数据来自当前 profile 的 package.json
+                    // （dsh.profile.bundles + dependencies）与 node_modules 里的真实
+                    // package.json，不猜测、不伪造。安装/启停等写操作不在本接口范围。
+                    case "/api/plugins": {
+                        String id = q.get("id");
+                        Instance t = id != null && !id.isBlank() ? find(id)
+                                : (inst.isEmpty() ? null : inst.get(0));
+                        String prof = t != null ? t.profile
+                                : q.getOrDefault("profile", "web");
+                        ok(ex, pluginsJson(prof));
+                        return;
+                    }
 
                     case "/api/update":
                         ok(ex, updateJson());
@@ -847,6 +921,526 @@ public class Backend {
     static String which(String cmd) {
         String s = shell("command -v " + cmd);
         return s.isBlank() ? "" : s;
+    }
+
+    // =====================================================================
+    //  插件清单
+    //  数据源（全部真实读取，不做任何推测）：
+    //    1. profiles/<profile>/package.json 的 dsh.profile.bundles —— 装载顺序
+    //    2. profiles/<profile>/package.json 的 dependencies    —— 依赖与来源
+    //    3. profiles/<profile>/node_modules/<pkg>/package.json —— 版本与描述
+    //    4. cordis.patch.yml 里的 disabled 标记                —— 启用状态
+    //  官方内置（@deepseek-ai/*）与第三方据此区分。
+    // =====================================================================
+    /**
+     * dsh 自身的运行骨架 bundle：不当作插件展示。
+     * 只是隐藏，不会卸载，dsh 启动完全照旧。
+     */
+    static final Set<String> SKELETON_BUNDLES = Set.of(
+            "@deepseek-ai/dsh-base",
+            "@deepseek-ai/dsh-web-app",
+            "@deepseek-ai/dsh-experimental-agent-team-profile");
+
+    /** 插件仅在用户显式请求时安装；此处只保留提示文案常量。 */
+    static final String PLUGIN_AUTO_DENY_MSG =
+            "启动器不会自动安装插件；插件安装只在你主动点击时执行";
+
+    /** POST /api/plugins/install —— 显式安装。带 package.json 备份与失败回滚。 */
+    static String pluginInstall(String spec, String profile, String registry, Instance t) {
+        Path profDir = profileDir(profile);
+        Path pkgJson = profDir.resolve("package.json");
+        if (!Files.isDirectory(profDir) || !Files.exists(pkgJson)) {
+            return "{\"ok\":false,\"error\":\"profile 目录不存在：" + esc(profDir.toString()) + "\"}";
+        }
+        String pnpm = which("pnpm");
+        if (pnpm.isBlank()) {
+            return "{\"ok\":false,\"error\":\"未找到 pnpm，请先安装 pnpm 后重试\"}";
+        }
+
+        // 安装前备份 package.json 与 lock，失败原样恢复
+        String pkgBackup;
+        String lockPath = profDir.resolve("pnpm-lock.yaml").toString();
+        String lockBackup = null;
+        try {
+            pkgBackup = new String(Files.readAllBytes(pkgJson), StandardCharsets.UTF_8);
+            if (Files.exists(Paths.get(lockPath))) {
+                lockBackup = new String(Files.readAllBytes(Paths.get(lockPath)), StandardCharsets.UTF_8);
+            }
+        } catch (Exception e) {
+            return "{\"ok\":false,\"error\":\"读取 profile 失败：" + esc(e.getMessage()) + "\"}";
+        }
+
+        if (t != null) addLog(t, "用户请求安装插件：" + spec + " → profile " + profile);
+
+        List<String> cmd = new ArrayList<>();
+        cmd.add(pnpm);
+        cmd.add("add");
+        cmd.add(spec);
+        cmd.add("--save-exact");
+        if ("mirror".equals(registry)) {
+            cmd.add("--registry=https://registry.npmmirror.com");
+        } else if ("npm".equals(registry)) {
+            cmd.add("--registry=https://registry.npmjs.org");
+        }
+
+        StringBuilder out = new StringBuilder();
+        int code = 1;
+        try {
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.directory(profDir.toFile());
+            pb.redirectErrorStream(true);
+            pb.environment().put("PATH", mergedPath());
+            pb.environment().put("NO_COLOR", "1");
+            pb.environment().put("FORCE_COLOR", "0");
+            Process p = pb.start();
+            try (BufferedReader r = new BufferedReader(
+                    new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String ln;
+                while ((ln = r.readLine()) != null) {
+                    out.append(ln).append('\n');
+                    if (t != null) addLog(t, "[pnpm] " + ln);
+                }
+            }
+            code = p.waitFor();
+        } catch (Exception e) {
+            out.append(e.getMessage());
+        }
+
+        if (code != 0) {
+            // 回滚：pnpm add 失败时 package.json / lock 可能已被改写
+            try {
+                Files.write(pkgJson, pkgBackup.getBytes(StandardCharsets.UTF_8));
+                if (lockBackup != null) {
+                    Files.write(Paths.get(lockPath), lockBackup.getBytes(StandardCharsets.UTF_8));
+                }
+                if (t != null) addLog(t, "安装失败，已回滚 package.json" + (lockBackup != null ? " 与 pnpm-lock.yaml" : ""));
+            } catch (Exception ignored) {}
+            return "{\"ok\":false,\"code\":" + code
+                    + ",\"rolledBack\":true,\"log\":\"" + esc(tail(out.toString(), 4000)) + "\"}";
+        }
+
+        if (t != null) addLog(t, "安装完成：" + spec + "（重启实例后生效）");
+        return "{\"ok\":true,\"code\":0,\"spec\":\"" + esc(spec) + "\",\"profile\":\"" + esc(profile)
+                + "\",\"needRestart\":true,\"log\":\"" + esc(tail(out.toString(), 4000)) + "\"}";
+    }
+
+    /** POST /api/plugins/uninstall —— 显式卸载。 */
+    static String pluginUninstall(String name, String profile, Instance t) {
+        Path profDir = profileDir(profile);
+        if (!Files.exists(profDir.resolve("package.json"))) {
+            return "{\"ok\":false,\"error\":\"profile 目录不存在：" + esc(profDir.toString()) + "\"}";
+        }
+        String pnpm = which("pnpm");
+        if (pnpm.isBlank()) return "{\"ok\":false,\"error\":\"未找到 pnpm\"}";
+
+        if (t != null) addLog(t, "用户请求卸载插件：" + name + " ← profile " + profile);
+
+        StringBuilder out = new StringBuilder();
+        int code = 1;
+        try {
+            ProcessBuilder pb = new ProcessBuilder(pnpm, "remove", name);
+            pb.directory(profDir.toFile());
+            pb.redirectErrorStream(true);
+            pb.environment().put("PATH", mergedPath());
+            pb.environment().put("NO_COLOR", "1");
+            pb.environment().put("FORCE_COLOR", "0");
+            Process p = pb.start();
+            try (BufferedReader r = new BufferedReader(
+                    new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String ln;
+                while ((ln = r.readLine()) != null) {
+                    out.append(ln).append('\n');
+                    if (t != null) addLog(t, "[pnpm] " + ln);
+                }
+            }
+            code = p.waitFor();
+        } catch (Exception e) {
+            out.append(e.getMessage());
+        }
+
+        if (code != 0) {
+            return "{\"ok\":false,\"code\":" + code + ",\"log\":\"" + esc(tail(out.toString(), 4000)) + "\"}";
+        }
+        if (t != null) addLog(t, "已卸载 " + name + "（重启实例后生效）");
+        return "{\"ok\":true,\"code\":0,\"name\":\"" + esc(name) + "\",\"needRestart\":true}";
+    }
+
+    /** POST /api/plugins/toggle —— 只改 cordis.patch.yml 里的 disabled 标记。 */
+    static String pluginToggle(String name, String profile, boolean enabled, Instance t) {
+        Path patchFile = profileDir(profile).resolve("cordis.patch.yml");
+        try {
+            String cur = Files.exists(patchFile)
+                    ? new String(Files.readAllBytes(patchFile), StandardCharsets.UTF_8)
+                    : "";
+            String next = setDisabledInPatch(cur, name, enabled);
+            Files.createDirectories(patchFile.getParent());
+            Files.write(patchFile, next.getBytes(StandardCharsets.UTF_8));
+            if (t != null) {
+                addLog(t, (enabled ? "已启用插件：" : "已禁用插件：") + name + "（重启实例后生效）");
+            }
+            return "{\"ok\":true,\"name\":\"" + esc(name) + "\",\"enabled\":" + enabled + ",\"needRestart\":true}";
+        } catch (Exception e) {
+            return "{\"ok\":false,\"error\":\"" + esc(e.getMessage()) + "\"}";
+        }
+    }
+
+    /**
+     * 在 patch YAML 里给某个包加/去 disabled 标记，其余内容逐字保留。
+     *
+     * patch 文件是一个顶层数组，每个条目形如：
+     *   - id: xxx
+     *     name: "@scope/pkg"
+     *     config: ...
+     * 所以匹配要按「条目块」判断 name/id，不能整行 contains ——
+     * 否则 dsh-code-checker 会误命中 dsh-code-checker-ext。
+     */
+    static String setDisabledInPatch(String yaml, String name, boolean enabled) {
+        String[] lines = yaml.split("\n", -1);
+
+        // 切分成条目块：以行首 "- " 为界。
+        // 规则：遇到 "- " 就开新块，但把「上一块尾部的连续空行」移到新块前面，
+        // 这样空行不会卡在上一块内部（否则 disabled 会被插到空行之后，
+        // 第二遍解析时两个块都匹配、都插一次）。
+        List<List<String>> blocks = new ArrayList<>();
+        List<String> cur = new ArrayList<>();
+        for (String ln : lines) {
+            if (ln.startsWith("- ") && hasBody(cur)) {
+                List<String> tail = new ArrayList<>();
+                while (!cur.isEmpty() && cur.get(cur.size() - 1).trim().isEmpty()) {
+                    tail.add(0, cur.remove(cur.size() - 1));
+                }
+                blocks.add(cur);
+                cur = new ArrayList<>(tail);
+            }
+            cur.add(ln);
+        }
+        if (!cur.isEmpty()) blocks.add(cur);
+
+        boolean hit = false;
+        for (List<String> blk : blocks) {
+            if (!blockMatches(blk, name)) continue;
+            hit = true;
+            int end = bodyEnd(blk);
+            // 去掉块内（body 范围）已有的 disabled 行
+            for (int k = end - 1; k >= 0; k--) {
+                if (blk.get(k).trim().startsWith("disabled:")) blk.remove(k);
+            }
+            if (!enabled) {
+                // 插入点：body 最后一行的后面，即尾部空行之前
+                blk.add(bodyEnd(blk), "  disabled: true");
+            }
+        }
+
+        // 文件里没有该条目时，禁用需要新增一个块；启用则无需动作
+        if (!hit && !enabled) {
+            List<String> nb = new ArrayList<>();
+            nb.add("- name: \"" + name + "\"");
+            nb.add("  disabled: true");
+            blocks.add(nb);
+        }
+
+        List<String> out = new ArrayList<>();
+        for (List<String> blk : blocks) out.addAll(blk);
+        return String.join("\n", out);
+    }
+
+    /** 列表里是否已经出现过条目首行（"- "），用于防止连续两个条目被合并。 */
+    static boolean hasBody(List<String> blk) {
+        for (String l : blk) if (l.startsWith("- ")) return true;
+        return false;
+    }
+
+    /** 块内第一行 "- " 开头的条目之后，属于该条目的有效内容行数（跳过尾部空行与注释）。 */
+    static int bodyEnd(List<String> blk) {
+        int end = blk.size();
+        while (end > 0) {
+            String t = blk.get(end - 1).trim();
+            if (t.isEmpty() || t.startsWith("#")) end--;
+            else break;
+        }
+        return end;
+    }
+
+    /** 条目块的 name/id 是否精确等于目标（支持带引号、@scope 与 "- name:" 首行写法）。 */
+    static boolean blockMatches(List<String> blk, String name) {
+        int end = bodyEnd(blk);
+        for (int k = 0; k < end; k++) {
+            String t = blk.get(k).trim();
+            // 顶层条目的首行形如 "- name: xxx"，要先剥掉列表符号
+            if (t.startsWith("- ")) t = t.substring(2).trim();
+            String v = null;
+            if (t.startsWith("name:")) v = t.substring(5).trim();
+            else if (t.startsWith("id:")) v = t.substring(3).trim();
+            if (v == null) continue;
+            v = v.replace("\"", "").replace("'", "").trim();
+            if (v.equals(name)) return true;
+        }
+        return false;
+    }
+
+    /** 取字符串尾部若干字符，避免日志过长撑爆响应。 */
+    static String tail(String s, int max) {
+        return s.length() <= max ? s : s.substring(s.length() - max);
+    }
+
+    static String pluginsJson(String profile) {
+        Path profDir = profileDir(profile);
+        Path pkgJson = profDir.resolve("package.json");
+        Path modDir = profDir.resolve("node_modules");
+        Path patchFile = profDir.resolve("cordis.patch.yml");
+
+        List<String> bundles = new ArrayList<>();
+        Map<String, String> deps = new LinkedHashMap<>();
+        String profileName = profile;
+
+        // ---- 1/2. 读 profile 的 package.json ----
+        if (Files.isReadable(pkgJson)) {
+            try {
+                String raw = Files.readString(pkgJson, StandardCharsets.UTF_8);
+                // dsh.profile.bundles 是字符串数组，按出现顺序抓取
+                int bi = raw.indexOf("\"bundles\"");
+                if (bi >= 0) {
+                    int lb = raw.indexOf('[', bi);
+                    int rb = lb < 0 ? -1 : raw.indexOf(']', lb);
+                    if (lb > 0 && rb > lb) {
+                        for (String seg : raw.substring(lb + 1, rb).split(",")) {
+                            String v = seg.trim();
+                            if (v.startsWith("\"") && v.endsWith("\"") && v.length() > 2) {
+                                bundles.add(v.substring(1, v.length() - 1));
+                            }
+                        }
+                    }
+                }
+                // dependencies：只需要顶层字符串键值
+                int di = raw.indexOf("\"dependencies\"");
+                if (di >= 0) {
+                    int lb = raw.indexOf('{', di);
+                    if (lb > 0) {
+                        int depth = 0, end = -1;
+                        for (int k = lb; k < raw.length(); k++) {
+                            char c = raw.charAt(k);
+                            if (c == '{') depth++;
+                            else if (c == '}') { depth--; if (depth == 0) { end = k; break; } }
+                            else if (c == '"' && depth == 1) {
+                                int close = raw.indexOf('"', k + 1);
+                                if (close < 0) break;
+                                String key = raw.substring(k + 1, close);
+                                int colon = raw.indexOf(':', close);
+                                int vq = raw.indexOf('"', colon);
+                                int vqEnd = vq < 0 ? -1 : raw.indexOf('"', vq + 1);
+                                if (colon > 0 && vq > 0 && vqEnd > vq) {
+                                    deps.put(key, raw.substring(vq + 1, vqEnd));
+                                    k = vqEnd;
+                                } else {
+                                    k = close;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) { }
+        }
+
+        // ---- 4. 补丁里的禁用标记 ----
+        Set<String> disabled = new HashSet<>();
+        if (Files.isReadable(patchFile)) {
+            try {
+                String prev = null;
+                for (String line : Files.readAllLines(patchFile, StandardCharsets.UTF_8)) {
+                    String s = line.trim();
+                    if (s.startsWith("name:")) {
+                        String v = s.substring(5).trim().replace("\"", "").replace("'", "");
+                        prev = v;
+                    } else if (s.startsWith("disabled:") && prev != null) {
+                        String v = s.substring(9).trim();
+                        if (v.equals("true")) disabled.add(prev);
+                        prev = null;
+                    }
+                }
+            } catch (Exception ignored) { }
+        }
+
+        // 已装载的 bundle 优先，其余依赖补在后面（同一个包只出现一次）
+        Set<String> seen = new LinkedHashSet<>(bundles);
+        seen.addAll(deps.keySet());
+
+        StringBuilder items = new StringBuilder();
+        int n = 0, enabledCount = 0;
+        // 全局 dsh 自带的包目录：官方 bundle 装在这里，profile 里不会有
+        List<Path> globalRoots = new ArrayList<>();
+        for (String h : new String[]{loginHome(), HOME}) {
+            if (h == null || h.isBlank()) continue;
+            globalRoots.add(Paths.get(h, ".npm-global", "lib", "node_modules",
+                    "@deepseek-ai", "dsh", "node_modules"));
+            globalRoots.add(Paths.get(h, "node_modules", "@deepseek-ai", "dsh", "node_modules"));
+        }
+        // 解析到的 dsh 二进制同级的全局安装目录也纳入候选
+        if (DSH_BIN.contains("/")) {
+            String dir = DSH_BIN.substring(0, DSH_BIN.lastIndexOf('/'));
+            int libIdx = dir.lastIndexOf("/bin");
+            String prefix = libIdx > 0 ? dir.substring(0, libIdx) : dir;
+            globalRoots.add(Paths.get(prefix, "lib", "node_modules",
+                    "@deepseek-ai", "dsh", "node_modules"));
+            globalRoots.add(Paths.get(prefix, "node_modules",
+                    "@deepseek-ai", "dsh", "node_modules"));
+        }
+        // 从 DSH_PROFILE_ROOT（<home>/.dsh/profiles）反推 <home>，
+        // 覆盖沙箱里 loginHome()/HOME 都指错的场景
+        String proot = System.getenv("DSH_PROFILE_ROOT");
+        if (proot != null && proot.contains("/.dsh/")) {
+            String h = proot.substring(0, proot.indexOf("/.dsh/"));
+            globalRoots.add(Paths.get(h, ".npm-global", "lib", "node_modules",
+                    "@deepseek-ai", "dsh", "node_modules"));
+        }
+        for (String name : seen) {
+            boolean official = name.startsWith("@deepseek-ai/");
+            String version = "";
+            String desc = "";
+            // 包的真实清单：先看 profile 自己的 node_modules，再看全局 dsh
+            List<Path> candidates = new ArrayList<>();
+            candidates.add(modDir.resolve(name).resolve("package.json"));
+            for (Path g : globalRoots) candidates.add(g.resolve(name).resolve("package.json"));
+            for (Path root : candidates) {
+                if (!Files.isReadable(root)) continue;
+                try {
+                    String raw = Files.readString(root, StandardCharsets.UTF_8);
+                    version = jsonFlatValue(raw, "version");
+                    desc = jsonFlatValue(raw, "description");
+                    break;
+                } catch (Exception ignored) { }
+            }
+            String spec = deps.getOrDefault(name, "");
+            boolean isBundle = bundles.contains(name);
+            boolean enabled = !disabled.contains(name);
+
+            // 官方 bundle（dsh-base / dsh-web-app / agent-team-profile 这类）
+            // 是 dsh 自身的运行骨架，没有独立插件语义，也不该出现在插件列表里。
+            // 这里只是不展示，不会卸载它们，dsh 启动照旧。
+            if (SKELETON_BUNDLES.contains(name)) continue;
+
+            if (n > 0) items.append(',');
+            n++;
+            if (enabled) enabledCount++;
+            items.append("{\"name\":\"").append(esc(name)).append("\",")
+                 .append("\"version\":\"").append(esc(version)).append("\",")
+                 .append("\"description\":\"").append(esc(desc)).append("\",")
+                 .append("\"spec\":\"").append(esc(spec)).append("\",")
+                 .append("\"official\":").append(official).append(',')
+                 .append("\"bundle\":").append(isBundle).append(',')
+                 .append("\"enabled\":").append(enabled).append(',')
+                 .append("\"source\":\"").append(esc(specSource(spec))).append("\"}");
+        }
+
+        // ---- 官方可选扩展：全局 dsh 里带 *-bundle 的包 ----
+        // 这些是随 dsh 一起分发、但当前 profile 没有装载的官方能力包。
+        // 只做只读展示，告诉用户"还有什么可加"，不涉及任何安装动作。
+        StringBuilder avail = new StringBuilder();
+        int an = 0;
+        Set<String> installedNames = new HashSet<>();
+        for (String nm : seen) installedNames.add(nm);
+        Set<String> availSeen = new LinkedHashSet<>();
+        for (Path g : globalRoots) {
+            if (!Files.isDirectory(g)) continue;
+            // 全局目录里包名带 scope，实际在 @deepseek-ai/ 子目录下；
+            // 也兼容直接平铺在根目录的情况。
+            List<Path> scanRoots = new ArrayList<>();
+            Path scoped = g.resolve("@deepseek-ai");
+            if (Files.isDirectory(scoped)) scanRoots.add(scoped);
+            scanRoots.add(g);
+            for (Path sr : scanRoots) {
+                File[] dirs = sr.toFile().listFiles();
+                if (dirs == null) continue;
+                for (File d : dirs) {
+                    if (!d.isDirectory()) continue;
+                    String nm = d.getName();
+                    if (!nm.startsWith("dsh-") || !nm.endsWith("-bundle")) continue;
+                    // 扫描根是 @deepseek-ai 时，包全名要补回 scope
+                    String full = sr.equals(scoped) ? "@deepseek-ai/" + nm : nm;
+                    if (installedNames.contains(full)) continue;
+                    Path pj = d.toPath().resolve("package.json");
+                    if (!Files.isReadable(pj)) continue;
+                    if (!availSeen.add(full)) continue;
+                    String ver = "", dsc = "";
+                    try {
+                        String raw = Files.readString(pj, StandardCharsets.UTF_8);
+                        ver = jsonFlatValue(raw, "version");
+                        dsc = jsonFlatValue(raw, "description");
+                    } catch (Exception ignored) { }
+                    if (an > 0) avail.append(',');
+                    an++;
+                    avail.append("{\"name\":\"").append(esc(full)).append("\",")
+                         .append("\"version\":\"").append(esc(ver)).append("\",")
+                         .append("\"description\":\"").append(esc(dsc)).append("\"}");
+                }
+            }
+        }
+
+        return "{\"profile\":\"" + esc(profileName) + "\","
+             + "\"profileDir\":\"" + esc(profDir.toString()) + "\","
+             + "\"exists\":" + Files.isDirectory(profDir) + ","
+             + "\"total\":" + n + ","
+             + "\"enabled\":" + enabledCount + ","
+             + "\"writable\":" + Files.isWritable(profDir) + ","
+             + "\"autoInstall\":false,"
+             + "\"available\":" + an + ","
+             + "\"availableItems\":[" + avail + "],"
+             + "\"items\":[" + items + "]}";
+    }
+
+    /**
+     * 定位某个 profile 的目录。
+     * 优先级：DSH_PROFILE_ROOT/<profile> → 登录用户 home/.dsh/profiles/<profile>
+     *        → HOME/.dsh/profiles/<profile>。
+     * 沙箱或容器里 user.name 可能是 root，loginHome() 拿到的是 /root，
+     * 此时靠 HOME 兜底；两者都不可用时再放开 DSH_PROFILE_ROOT。
+     */
+    static Path profileDir(String profile) {
+        String root = System.getenv("DSH_PROFILE_ROOT");
+        if (root != null && !root.isBlank()) {
+            Path p = Paths.get(root, profile);
+            if (Files.isDirectory(p)) return p;
+        }
+        for (String h : new String[]{loginHome(), HOME}) {
+            if (h == null || h.isBlank()) continue;
+            Path p = Paths.get(h, ".dsh", "profiles", profile);
+            if (Files.isDirectory(p)) return p;
+        }
+        String h = loginHome();
+        if (h == null || h.isBlank()) h = HOME;
+        return Paths.get(h, ".dsh", "profiles", profile);
+    }
+
+    /** 从 JSON 文本里取一个顶层字符串字段的值，够用即可。 */
+    static String jsonFlatValue(String raw, String key) {
+        int i = raw.indexOf("\"" + key + "\"");
+        if (i < 0) return "";
+        int colon = raw.indexOf(':', i + key.length() + 2);
+        if (colon < 0) return "";
+        int q1 = raw.indexOf('"', colon);
+        if (q1 < 0) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int k = q1 + 1; k < raw.length(); k++) {
+            char c = raw.charAt(k);
+            if (c == '\\' && k + 1 < raw.length()) {
+                char nx = raw.charAt(++k);
+                sb.append(nx == 'n' ? '\n' : nx == 't' ? '\t' : nx);
+            } else if (c == '"') {
+                break;
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 把依赖 spec 归类成人类可读的来源。 */
+    static String specSource(String spec) {
+        if (spec == null || spec.isBlank()) return "profile";
+        if (spec.startsWith("github:") || spec.contains("github.com")) return "github";
+        if (spec.startsWith("http") || spec.endsWith(".tar.gz") || spec.endsWith(".tgz")) return "archive";
+        if (spec.startsWith("file:") || spec.startsWith("./") || spec.startsWith("/")) return "local";
+        if (spec.startsWith("workspace:")) return "workspace";
+        return "npm";
     }
 
     /**

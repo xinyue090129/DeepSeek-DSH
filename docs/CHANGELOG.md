@@ -1,5 +1,76 @@
 # 迭代记录
 
+## v2.7 — 2026-11-07 · 修复插件页无法滚动
+
+**问题**：插件页内容一多，下方内容被裁掉，鼠标滚轮也滚不动。
+
+**根因**
+桌面断点（≥701px）下 `html, body { overflow: hidden }`、`.main-content` 也是
+`overflow: hidden`，控制台靠 `.dashboard-grid` 的 flex 撑满高度所以没事；
+但 `#pluginView` 是纯流式内容，没有自己的滚动容器，超出部分直接被裁。
+`grep pluginView style.css` 当时是 0 命中 —— 这个视图从来没被单独定义过。
+
+**改动**
+- `#pluginView` 加 `flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden`，
+  并 `scrollbar-gutter: stable` 避免滚动条出现/消失时内容横向跳动。
+- 滚动条配色：深色主题 `rgba(255,255,255,.13)`，浅色主题
+  `body.light` 下单独覆盖成 `rgba(70,86,105,.24)`，都用 `content-box` 裁边做圆角细条。
+- `<701px` 窄屏是整页滚动（body 没有 `overflow:hidden`），
+  该断点下把 `#pluginView` 的 `overflow` 还原成 `visible`，否则会出现双滚动条。
+- 新增 `body.modal-open { overflow:hidden }`：弹窗打开时锁背景滚动，
+  免得在弹窗上滚滚轮把底下的插件列表带着跑。
+  用重写 `HTMLDialogElement.prototype.showModal` + 监听 `close` 事件统一收口，
+  覆盖 Esc / 关闭按钮 / `form method=dialog` 全部关闭路径，不用逐处改调用点。
+
+## v2.6 — 2026-11-07 · 插件安装改为「仅用户显式触发」
+
+**需求**：启动器不要自动安装插件。
+
+**排查结论（基于 dsh 源码实证）**
+- `dsh-app-boot` 全文无 `spawn` / `child_process`，启动链路不执行任何外部命令。
+- `initProfile()` 只写 `package.json`（`dependencies: {}`）、`cordis.patch.yml` 模板、
+  `pnpm-workspace.yaml` 三个空壳文件，注释写明 *Existing files are never touched*。
+- `dsh-plugin-manager` 的 `installBundle()` 是 `@Remote` 方法，只有界面显式调用才执行；
+  全文件无 `setInterval`，三个 `setTimeout` 均为进程树等待 / 管道超时 / 静默看门狗。
+- `autoInstallPeers: false` 是 pnpm 的设置（禁止自动补 peer），与 dsh 行为无关。
+- 结论：dsh 本身就没有自动装插件机制。
+
+**启动器侧的保证**
+- `GET /api/health` 新增 `pluginAutoInstall:false` 字段，可直接验证。
+- 启动、重启、日志长轮询、环境检测等全部自动流程均不触碰 npm / pnpm。
+- 后端文件头写明「不自动安装，只在用户显式请求时安装」的原则。
+
+**新增三个写接口（全部只响应用户点击）**
+- `POST /api/plugins/install` `{spec, profile, registry}`
+  执行一次 `pnpm add <spec> --save-exact`；安装前备份 `package.json` 与
+  `pnpm-lock.yaml`，**失败自动回滚**；pnpm 输出逐行转发到控制台日志。
+- `POST /api/plugins/uninstall` `{name, profile}` —— `pnpm remove <name>`。
+- `POST /api/plugins/toggle` `{name, enabled, profile}` —— 只改
+  `cordis.patch.yml` 的 `disabled` 标记，不动 `node_modules`。
+
+**patch 写入的正确性**（这部分踩了坑）
+- 最初用「整行 contains 匹配」，`dsh-code-checker` 会误命中
+  `dsh-code-checker-ext`，且顶层条目首行 `- name: xxx` 无法匹配；
+  接口还会返回成功却没写任何内容。
+- 改为**按条目块解析**：以行首 `- ` 切块，块间空行归属下一块，
+  `bodyEnd()` 跳过尾部空行，匹配时先剥掉 `- ` 前缀再比 `name:` / `id:`。
+- 已用 16 条断言 + 真实 `cordis.patch.yml` 三个条目验证：
+  禁用、重复禁用幂等、启用后逐字还原、前缀不误伤、缺失条目自动新增。
+
+**前端**
+- 「解析安装」→ 确认弹窗 → 勾选「我已确认来源可信」→「确认安装」才发请求；
+  安装中按钮显示「安装中…」，失败提示是否已回滚。
+- 插件卡片开关不再置灰，改为真正调用 `/api/plugins/toggle`，
+  失败自动拨回原状态。
+- `writable` 字段改为真实检测 `Files.isWritable(profileDir)`。
+
+**构建脚本**
+- 修复本机 `/tmp` 只有 10M 导致 `javac` 报
+  `insufficient memory ... Failed to reserve memory for metaspace` 的问题：
+  把 `TMPDIR` 指到项目内 `.buildtmp/`，并限制 JVM 预留内存。
+  这是**临时目录太小**，不是内存不足，普通桌面环境同样适用。
+- `.buildtmp/` 加入 `.gitignore`。
+
 ## v2.5 — 2026-11-07 · 工作台改为应用内窗口
 
 **需求**：进入工作台不要跳到外部浏览器。

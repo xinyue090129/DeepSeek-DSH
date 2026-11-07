@@ -15,6 +15,7 @@ hs_err_pid*.log
 replay_pid*.log
 core.[0-9]*
 *.log
+.buildtmp/
 
 # ---- 编辑器 / 系统 ----
 .vscode/

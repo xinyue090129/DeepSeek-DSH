@@ -10,7 +10,14 @@ export PATH="$HOME/.cargo/bin:$PATH"
 echo ">>> [1/4] 编译 Java 后端"
 rm -rf backend/out
 mkdir -p backend/out
-javac -encoding UTF-8 -d backend/out backend/src/com/dshlauncher/Backend.java
+# 沙箱/容器里 /tmp 可能极小（本机 10M），JVM 写不进临时文件会直接 OOM 崩掉；
+# 这里把 TMPDIR 指到项目内，并限制 JVM 预留内存，普通桌面环境同样适用。
+BUILD_TMP="$HERE/.buildtmp"
+mkdir -p "$BUILD_TMP"
+TMPDIR="$BUILD_TMP" javac \
+    -J-Xmx96m -J-XX:MaxMetaspaceSize=64m \
+    -J-XX:CompressedClassSpaceSize=32m -J-XX:ReservedCodeCacheSize=24m \
+    -encoding UTF-8 -d backend/out backend/src/com/dshlauncher/Backend.java
 
 echo ">>> [2/4] 打包 dsh-backend.jar"
 jar --create --file backend/dsh-backend.jar \
