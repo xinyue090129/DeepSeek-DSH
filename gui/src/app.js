@@ -335,35 +335,78 @@
   });
 
   $("stopButton").addEventListener("click", () => {
+    const it = st.instance;
     const target = currentId(); if (!target) return;
+    // 运行中停止才确认；启动中卡住了直接让停，别拦
+    if (it && it.state === "running" && !confirm(`确定停止 ${it.name} 吗？\n工作台会关闭，未保存的对话可能丢失。`)) {
+      return;
+    }
     act(async () => {
       stopWatch();
       await api("/api/instances/stop", { id: target });
-      toast("已发送停止请求");
-      await poll();
+      toast("正在停止…");
+      // 等真的停下来再给结论，别只甩一句「已发送请求」
+      const done = await waitForState(target, ["stopped", "error"], 12000);
+      if (done) {
+        await poll();
+        toast(done === "stopped" ? "已停止" : "已停止（异常退出）");
+      } else {
+        toast("停止指令已发出，但进程仍未退出，请查看日志");
+      }
     });
   });
+
+  /** 轮询等待实例进入目标状态之一，超时返回 null。 */
+  async function waitForState(id, targets, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const list = await api("/api/instances");
+        const cur = (list || []).find((i) => i.id === id);
+        if (cur && targets.includes(cur.state)) return cur.state;
+      } catch (_) { /* 后端暂时不可用，继续等 */ }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    return null;
+  }
 
   $("restartButton").addEventListener("click", () => {
     const target = currentId(); if (!target) return;
     act(async () => {
+      stopWatch();
       st.instance.state = "starting";
       st.since = 0;
       render();
       await api("/api/instances/restart", { id: target });
       toast("正在重启…");
+      await poll();
+      // 等它重新跑起来（或失败），再给结论
+      const done = await waitForState(target, ["running", "error", "stopped"], 60000);
+      await poll();
+      if (done === "running") toast("已重启，可以进入工作台");
+      else if (done) toast("重启未成功：" + LABEL[done]);
+      else toast("重启耗时较长，仍在启动中，请查看日志");
     });
+    if (AUTO_OPEN) watchReadyToOpen();
   });
 
   $("safeStartButton").addEventListener("click", () => {
     const target = currentId(); if (!target) return;
     act(async () => {
+      stopWatch();
       st.instance.state = "starting";
       st.since = 0;
       render();
       await api("/api/start-safe", { id: target });
       toast("安全启动：已跳过全部补丁");
+      await poll();
+      const done = await waitForState(target, ["running", "error", "stopped"], 60000);
+      await poll();
+      if (done === "running") toast("安全启动成功");
+      else if (done) toast("安全启动未成功：" + LABEL[done]);
+      else toast("仍在启动中，请查看日志");
     });
+    if (AUTO_OPEN) watchReadyToOpen();
   });
 
   $("webPanel").addEventListener("click", () => {
@@ -400,6 +443,17 @@
   });
 
   // ---------------------------------------------------------------- 其它
+  $("aboutButton")?.addEventListener("click", async () => {
+    const el = $("aboutVersion");
+    let version = "Tauri + Java 后端";
+    try {
+      const h = await api("/api/health");
+      if (h && h.version) version = `后端 v${h.version} · Tauri 2 + Java`;
+    } catch (_) { /* 后端没起就显示默认文案 */ }
+    if (el) el.textContent = version;
+    $("aboutModal")?.showModal();
+  });
+
   $("activityButton").addEventListener("click", () => {
     const box = $("logWindow");
     box.scrollTop = box.scrollHeight;
