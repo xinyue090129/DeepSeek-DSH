@@ -309,6 +309,9 @@ body.light #pluginView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,1
     min-height: 0;
     max-height: none;
     flex: 1 1 auto;
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-gutter: stable;
   }
   .bottom-actions .secondary-button {
     min-height: clamp(48px, 6.5vh, 62px);
@@ -378,6 +381,267 @@ body.light #pluginView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,1
 
 /* 弹窗打开时锁住背景滚动，避免滚轮把底下的列表带着跑 */
 body.modal-open { overflow: hidden; }
+
+/* =====================================================================
+   设置页（PREFERENCES）
+   —— 沿用 DSHA-PC-Settings 原型的「分类列表 → 点进详情 → 返回」单列流，
+      颜色改用控制中心自身的设计变量，保证深浅主题都成立。
+   ===================================================================== */
+#settingsView {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  padding-bottom: 8px;
+}
+#settingsView::-webkit-scrollbar { width: 10px; }
+#settingsView::-webkit-scrollbar-track { background: transparent; }
+#settingsView::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,.13);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+#settingsView::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.24); background-clip: content-box; }
+
+@media (max-width: 700px) {
+  #settingsView {
+    flex: 0 0 auto;
+    overflow: visible;
+    scrollbar-gutter: auto;
+    padding-bottom: 0;
+  }
+}
+
+/* 搜索框 */
+.settings-search {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 0 16px;
+  height: 52px;
+  margin-bottom: 26px;
+  border: 1px solid var(--border-strong);
+  border-radius: 15px;
+  background: rgba(0,0,0,.14);
+  transition: border-color .16s ease;
+}
+.settings-search:focus-within { border-color: rgba(108,164,255,.62); }
+.settings-search .search-icon { font-size: 19px; color: var(--subtle); flex: 0 0 auto; }
+.settings-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  outline: none;
+}
+.settings-search input::placeholder { color: var(--subtle); }
+.settings-search kbd {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: .4px;
+  color: var(--subtle);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 7px;
+}
+
+/* 分组标题 */
+.settings-group-heading {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 30px 2px 12px;
+  color: var(--subtle);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+.settings-group-heading:first-child { margin-top: 0; }
+.settings-group-heading i { flex: 1 1 auto; height: 1px; background: var(--border); }
+
+/* 分组卡片 */
+.settings-group-card {
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  background: linear-gradient(145deg,rgba(27,32,38,.9),rgba(17,21,26,.94));
+  overflow: hidden;
+}
+.settings-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  padding: 15px 18px;
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  text-align: left;
+  transition: background .15s ease;
+}
+.settings-row:first-child { border-top: 0; }
+.settings-row:hover { background: var(--surface-hover); }
+
+.settings-icon {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  font-size: 18px;
+  background: rgba(108,164,255,.14);
+  color: var(--accent);
+}
+.settings-icon.blue { background: rgba(108,164,255,.14); color: #6ca4ff; }
+.settings-icon.violet { background: rgba(167,139,250,.15); color: #a78bfa; }
+.settings-icon.teal { background: rgba(45,212,191,.14); color: #2dd4bf; }
+.settings-icon.orange { background: rgba(251,146,60,.15); color: #fb923c; }
+.settings-icon.green { background: rgba(66,211,146,.14); color: #42d392; }
+.settings-icon.pink { background: rgba(244,114,182,.15); color: #f472b6; }
+.settings-icon.amber { background: rgba(241,189,88,.15); color: #f1bd58; }
+.settings-icon.slate { background: rgba(148,163,184,.16); color: #94a3b8; }
+.settings-icon.gray { background: rgba(148,163,184,.12); color: #a8b0bb; }
+
+.settings-copy { flex: 1 1 auto; min-width: 0; display: grid; gap: 4px; }
+.settings-copy b { font-size: 15px; font-weight: 600; color: var(--text); }
+.settings-copy small { font-size: 12.5px; color: var(--subtle); line-height: 1.45; }
+.settings-arrow { flex: 0 0 auto; color: var(--subtle); font-size: 22px; line-height: 1; }
+
+/* 详情页 */
+.settings-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 11px;
+  background: transparent;
+  color: var(--muted);
+  padding: 9px 16px;
+  font-size: 13.5px;
+  margin-bottom: 22px;
+  transition: background .16s ease, color .16s ease;
+}
+.settings-back:hover { background: var(--surface-hover); color: var(--text); }
+.settings-back span { font-size: 16px; line-height: 1; }
+
+#settingsDetailBody h2 { font-size: 23px; font-weight: 600; margin: 0 0 8px; letter-spacing: -.4px; }
+.settings-sub { color: var(--muted); font-size: 14px; margin: 0 0 22px; }
+
+.settings-panel {
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  background: linear-gradient(145deg,rgba(27,32,38,.9),rgba(17,21,26,.94));
+  overflow: hidden;
+}
+.settings-option {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 15px 18px;
+  border-top: 1px solid var(--border);
+}
+.settings-option:first-child { border-top: 0; }
+.settings-option-copy { flex: 1 1 auto; min-width: 0; display: grid; gap: 4px; }
+.settings-option-copy b { font-size: 14.5px; font-weight: 600; color: var(--text); }
+.settings-option-copy small { font-size: 12.5px; color: var(--subtle); line-height: 1.45; }
+
+.settings-value {
+  flex: 0 0 auto;
+  max-width: 52%;
+  text-align: right;
+  font-size: 13.5px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.settings-input {
+  flex: 0 0 auto;
+  width: 210px;
+  max-width: 46%;
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: rgba(0,0,0,.2);
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+  outline: none;
+  transition: border-color .16s ease;
+}
+.settings-input:focus { border-color: rgba(108,164,255,.62); }
+select.settings-input { cursor: pointer; }
+.settings-hint { color: var(--subtle); }
+.settings-hint:not(:empty) { color: var(--warn); }
+
+/* 开关 */
+.settings-switch {
+  flex: 0 0 auto;
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  width: 46px;
+  height: 26px;
+  margin: 0;
+  border-radius: 999px;
+  background: rgba(164,177,192,.28);
+  cursor: pointer;
+  transition: background .18s ease;
+}
+.settings-switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #eef2f7;
+  transition: transform .18s ease;
+}
+.settings-switch:checked { background: var(--accent-2); }
+.settings-switch:checked::after { transform: translateX(20px); }
+.settings-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+/* 操作按钮 */
+.settings-action {
+  flex: 0 0 auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--accent);
+  padding: 9px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  transition: background .16s ease;
+}
+.settings-action:hover { background: var(--surface-hover); }
+
+.settings-note {
+  margin: 18px 2px 0;
+  font-size: 12.5px;
+  color: var(--subtle);
+  line-height: 1.6;
+}
+
+/* 浅色主题 */
+body.light #settingsView::-webkit-scrollbar-thumb { background: rgba(70,86,105,.24); background-clip: content-box; }
+body.light #settingsView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,105,.4); background-clip: content-box; }
+body.light .settings-search { background: #fff; }
+body.light .settings-group-card,
+body.light .settings-panel { background: #fff; }
+body.light .settings-row:hover { background: #f2f6fb; }
+body.light .settings-input { background: #f8fafc; }
+body.light .settings-switch { background: #c2cad4; }
+body.light .settings-switch:checked { background: var(--accent-2); }
+body.light .settings-switch::after { background: #fff; }
 
 .plugin-count-badge { border: 1px solid var(--border-strong); border-radius: 999px; padding: 7px 15px; font-size: 13px; color: var(--muted); }
 .plugin-count-badge b { color: var(--text); font-weight: 600; }

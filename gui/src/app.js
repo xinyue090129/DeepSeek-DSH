@@ -58,7 +58,6 @@
     backendUp: false,
     busy: false,
     autoScroll: true,
-    paused: false,
     localOffset: 0,   // 已渲染的绝对行号（含被后端裁掉的部分）
     ready: false
   };
@@ -110,20 +109,6 @@
     box.appendChild(frag);
     while (box.childElementCount > 3000) box.removeChild(box.firstElementChild);
     if (st.autoScroll) box.scrollTop = box.scrollHeight;
-  }
-
-  function clearLogs() {
-    $("logWindow").innerHTML = "";
-    st.localOffset = 0;
-  }
-
-  function setLive(mode) {
-    const el = $("logLive");
-    if (!el) return;
-    el.classList.toggle("paused", mode === "paused");
-    el.classList.toggle("offline", mode === "offline");
-    el.lastChild.nodeValue = mode === "paused" ? "已暂停"
-      : mode === "offline" ? "重连中" : "实时";
   }
 
   // ---------------------------------------------------------------- 渲染
@@ -223,7 +208,7 @@
    */
   async function pullLogs(wait) {
     const it = st.instance;
-    if (!it || st.paused) return;
+    if (!it) return;
     const q = `/api/instances/logs?id=${encodeURIComponent(it.id)}&since=${st.since}` + (wait ? "&wait=1" : "");
     const r = await api(q);
     const lines = r.lines || [];
@@ -242,21 +227,14 @@
   async function logLoop() {
     let backoff = 400;
     while (true) {
-      if (st.paused) {
-        await sleep(400);
-        backoff = 400;
-        continue;
-      }
       if (!st.instance) {
         await sleep(600);
         continue;
       }
       try {
         await pullLogs(true);
-        setLive("live");
         backoff = 400;
       } catch (_) {
-        setLive("offline");
         await sleep(backoff);
         backoff = Math.min(backoff * 2, 5000);
       }
@@ -541,24 +519,6 @@
     toast("已定位到最新日志");
   });
 
-  $("logsTabButton").addEventListener("click", () => {
-    $("logWindow").scrollTop = 0;
-    toast("已回到日志开头");
-  });
-
-  $("logPauseButton").addEventListener("click", () => {
-    st.paused = !st.paused;
-    $("logPauseButton").textContent = st.paused ? "继续" : "暂停";
-    setLive(st.paused ? "paused" : "live");
-    if (!st.paused) pullLogs(true).catch(() => {});
-    toast(st.paused ? "日志已暂停" : "日志已继续");
-  });
-
-  $("logClearButton").addEventListener("click", () => {
-    clearLogs();
-    toast("已清屏（后端日志保留）");
-  });
-
   // 用户手动往上翻时暂停自动滚动，滑回底部再恢复
   let scrollGuard = 0;
   $("logWindow").addEventListener("scroll", () => {
@@ -604,8 +564,8 @@
       showView("plugins");
       loadPlugins();
     } else if (page === "settings") {
-      showView("console");
-      $("settingsButton").click();
+      showView("settings");
+      settingsHome();
     } else {
       showView("console");
     }
@@ -625,9 +585,9 @@
   //  插件页
   //  数据来自后端 /api/plugins：真实读取 profile 的 package.json、
   //  node_modules 里的包清单和补丁里的 disabled 标记。
-  //  红线：启动器只读插件清单，永不安装 / 升级 / 卸载 / 启停插件。
-  //  所有写入口在后端都被显式拒绝（见 Backend 的 READ_GUARD），
-  //  界面上也不提供任何能触发写入的按钮 —— 见 docs/CHANGELOG.md。
+  //  原则：启动器**不自动安装插件** —— 启动、重启、轮询、环境检测都不碰 npm。
+  //  只有用户在这里显式点「安装 / 升级 / 启停」时，
+  //  才会调用 /api/plugins/install | uninstall | toggle 真的执行。
   // =====================================================================
   const plug = {
     items: [],
@@ -649,10 +609,13 @@
   function showView(which) {
     $("consoleView").hidden = which !== "console";
     $("pluginView").hidden = which !== "plugins";
+    $("settingsView").hidden = which !== "settings";
     document.querySelectorAll(".nav-item").forEach((n) => {
       const p = n.dataset.page;
       n.classList.toggle("active",
-        (which === "plugins" && p === "plugins") || (which === "console" && p === "overview"));
+        (which === "plugins" && p === "plugins")
+        || (which === "settings" && p === "settings")
+        || (which === "console" && p === "overview"));
     });
   }
 
@@ -974,7 +937,9 @@
   $("sourceSelect").addEventListener("change", (e) => {
     const label = e.target.options[e.target.selectedIndex].textContent;
     toast("下载源：" + label);
-  });  $("pasteButton").addEventListener("click", async () => {
+  });
+
+  $("pasteButton").addEventListener("click", async () => {
     try {
       pluginSource.value = await navigator.clipboard.readText();
       pluginSource.dispatchEvent(new Event("input"));
@@ -989,35 +954,7 @@
     return s.trim().replace(/\/+$/, "").split("/").pop().replace(/\.git$/, "");
   }
 
-  $("parseButton").addEventListener("click", () => {
-    const v = pluginSource.value.trim();
-    if (!v) return;
-    $("candidateName").textContent = specBasename(v) || v;
-    $("candidateSource").textContent = v;
-    $("installNote").textContent = "启动器只读：不会安装、不会写入 profile、不会调用 npm / pnpm。";
-    $("installModal").showModal();
-  });
-  // 弹窗里唯一的动作是把来源复制出来，方便去 dsh 自带的插件管理界面粘贴
-  $("installForm").addEventListener("submit", async (e) => {
-    if (!e.submitter || e.submitter.id !== "copySpec") return;
-    e.preventDefault();
-    const spec = ($("candidateSource").textContent || "").trim();
-    $("installModal").close();
-    if (!spec) return;
-    try {
-      await navigator.clipboard.writeText(spec);
-      toast("已复制来源，可粘贴到 dsh 插件管理界面");
-    } catch (_) {
-      toast("复制失败，请手动选中来源复制");
-    }
-  });
-
-  $("sourceSelect").addEventListener("change", (e) => {
-    const label = e.target.options[e.target.selectedIndex].textContent;
-    toast("已记录下载源：" + label + "（启动器不下载任何内容）");
-  });
-
-  // ---- 导入 / 导出 / 社区：启动器只读，不参与插件增删 ----
+  // ---- 导入 / 导出 / 社区：启动器不参与这三件事 ----
   // 隐藏文件选择器本身仍保留在 DOM，但选择后不做任何写入。
   $("importButton").addEventListener("click", () => $("pluginFile").click());
   $("pluginFile").addEventListener("change", (e) => {
@@ -1026,79 +963,414 @@
     e.target.value = "";
   });
   $("exportButton").addEventListener("click", () => {
-    toast("启动器只读插件清单，不导出、不打包插件");
+    toast("启动器不导出、不打包插件清单");
   });
   $("communityButton").addEventListener("click", () => {
     toast("社区插件源需在 dsh 自带插件管理界面浏览");
   });
 
-  // ---------------------------------------------------------------- 设置
-  // 设置里改的是「dsh 工作台端口」，保存后写进实例配置，下次启动生效。
-  const portNote = $("portCheckNote");
+  // =====================================================================
+  //  设置页
+  //  结构沿用 DSHA-PC-Settings 原型的「分类列表 → 点进详情 → 返回」单列方式。
+  //  数据原则：能真生效的项接真接口（实例配置 / 后端状态），
+  //  启动器里做不到的项如实标注「仅显示」，不假装可改。
+  // =====================================================================
+  const settings = { page: null, env: null };
 
-  async function checkPort(port) {
-    if (!portNote) return;
-    const p = parseInt(port, 10);
-    if (!p || p < 1024 || p > 65535) {
-      portNote.textContent = p ? "端口范围应为 1024–65535" : "";
-      return;
-    }
-    try {
-      const r = await api("/api/port-check?port=" + p);
-      portNote.textContent = r.inUse
-        ? `端口 ${p} 已被占用，开启「自动回退」或换一个`
-        : `端口 ${p} 可用`;
-    } catch (_) { portNote.textContent = ""; }
+  // 分类定义。kind 决定渲染方式：
+  //   true  = 有真实读写接口（走 /api/instances/update 等）
+  //   false = 只读展示，界面上明确标注
+  const SETTING_GROUPS = [
+    {
+      title: "常规",
+      items: [
+        {
+          key: "basic", name: "基础设置", desc: "主题、语言与界面偏好",
+          icon: "blue", glyph: "☀",
+          rows: [
+            { name: "主题", desc: "深色 / 浅色，立即生效", type: "select",
+              options: ["深色", "浅色"], get: () => document.body.classList.contains("light") ? "浅色" : "深色",
+              set: (v) => {
+                const light = v === "浅色";
+                document.body.classList.toggle("light", light);
+                localStorage.setItem("dsha.theme", light ? "light" : "dark");
+              } },
+            { name: "界面语言", desc: "启动器目前仅提供简体中文", type: "info",
+              get: () => "简体中文" },
+            { name: "打开启动器时自动启动", desc: "默认关闭，由你手动点「启动 DSHA」", type: "switch",
+              get: () => AUTO_START,
+              set: (v) => { AUTO_START = v; localStorage.setItem("dsha.autoStart", v ? "1" : "0"); } },
+            { name: "就绪后自动进入工作台", desc: "dsh 就绪后在应用内窗口打开工作台", type: "switch",
+              get: () => AUTO_OPEN,
+              set: (v) => { AUTO_OPEN = v; localStorage.setItem("dsha.autoOpen", v ? "1" : "0"); } },
+          ],
+        },
+        {
+          key: "dsh", name: "DSH 设置", desc: "实例名称、profile 与启动参数",
+          icon: "violet", glyph: "✦",
+          rows: [
+            { name: "实例名称", desc: "显示在控制中心标题处", type: "text",
+              get: () => st.instance?.name || "",
+              set: (v) => updateInstance({ name: v }) },
+            { name: "profile", desc: "dsh 使用的 profile，切换后需重启", type: "text",
+              get: () => st.instance?.profile || "",
+              set: (v) => updateInstance({ profile: v }) },
+            { name: "启动模式", desc: "npm = 全局 dsh；local = 走 npx", type: "select",
+              options: ["npm", "local"],
+              get: () => st.instance?.mode || "npm",
+              set: (v) => updateInstance({ mode: v }) },
+            { name: "附加启动参数", desc: "追加到 dsh 命令后面，如 --no-open", type: "text",
+              get: () => st.instance?.extraArgs || "",
+              set: (v) => updateInstance({ extraArgs: v }) },
+          ],
+        },
+        {
+          key: "runtime", name: "运行环境", desc: "工作目录、环境变量与补丁",
+          icon: "teal", glyph: "▤",
+          rows: [
+            { name: "工作目录", desc: "dsh 进程的当前目录", type: "text",
+              get: () => st.instance?.cwd || "",
+              set: (v) => updateInstance({ cwd: v }) },
+            { name: "环境变量", desc: "每行一个 KEY=VALUE", type: "text",
+              get: () => st.instance?.envText || "",
+              set: (v) => updateInstance({ envText: v }) },
+            { name: "额外补丁文件", desc: "逗号或换行分隔的 yml 路径", type: "text",
+              get: () => st.instance?.patches || "",
+              set: (v) => updateInstance({ patches: v }) },
+            { name: "Java 版本", desc: "后端运行环境", type: "info",
+              get: () => settings.env?.java || "—" },
+            { name: "桌面会话", desc: "当前显示会话类型", type: "info",
+              get: () => `${settings.env?.session || "?"} · ${settings.env?.desktop || "?"}` },
+          ],
+        },
+      ],
+    },
+    {
+      title: "服务与扩展",
+      items: [
+        {
+          key: "web", name: "Web UI", desc: "工作台端口与访问方式",
+          icon: "orange", glyph: "▭",
+          rows: [
+            { name: "自动分配端口", desc: "交给系统挑空闲端口，避免冲突", type: "switch",
+              get: () => !!st.instance?.autoPort,
+              set: (v) => updateInstance({ autoPort: String(v) }) },
+            { name: "端口冲突时自动回退", desc: "固定端口被占用时改用随机端口", type: "switch",
+              get: () => st.instance?.portFallback !== false,
+              set: (v) => updateInstance({ portFallback: String(v) }) },
+            { name: "Web 端口", desc: "工作台监听端口，1024–65535，重启后生效", type: "number",
+              get: () => String(st.instance?.port ?? 3080),
+              set: (v) => {
+                const p = parseInt(v, 10);
+                if (!p || p < 1024 || p > 65535) { toast("端口需在 1024–65535 之间"); return false; }
+                return updateInstance({ port: String(p) });
+              },
+              check: async (v) => {
+                const p = parseInt(v, 10);
+                if (!p || p < 1024 || p > 65535) return "端口范围应为 1024–65535";
+                try {
+                  const r = await api("/api/port-check?port=" + p);
+                  return r.inUse ? `端口 ${p} 已被占用` : `端口 ${p} 可用`;
+                } catch (_) { return ""; }
+              } },
+            { name: "当前运行端口", desc: "dsh 实际监听的端口", type: "info",
+              get: () => st.instance?.state === "running"
+                ? String(st.instance.actualPort)
+                : "未运行" },
+          ],
+        },
+        {
+          key: "network", name: "网络设置", desc: "代理与连通性",
+          icon: "green", glyph: "≋",
+          rows: [
+            { name: "代理环境变量", desc: "填在「运行环境 → 环境变量」里才对 dsh 生效", type: "info",
+              get: () => {
+                const e = (st.instance?.envText || "").toLowerCase();
+                if (e.includes("http_proxy") || e.includes("https_proxy")) return "已配置";
+                const sys = ["http_proxy", "https_proxy", "all_proxy"].filter((k) => false);
+                return "未配置";
+              } },
+            { name: "niri", desc: "窗口管理依赖", type: "info",
+              get: () => envItem("niri") },
+            { name: "Edge", desc: "外部打开工作台时使用", type: "info",
+              get: () => envItem("edge") },
+          ],
+        },
+        {
+          key: "plugins", name: "插件设置", desc: "插件来源、更新与启停",
+          icon: "pink", glyph: "✚",
+          rows: [
+            { name: "已安装插件", desc: "当前 profile 装载的插件数量", type: "info",
+              get: () => plug.loaded ? `${plug.items.length} 个` : "点「插件」页加载" },
+            { name: "插件目录", desc: "profile 所在位置", type: "info",
+              get: () => plug.profile ? `~/.dsh/profiles/${plug.profile}` : "—" },
+            { name: "前往插件管理", desc: "安装、升级、启停都在插件页完成", type: "action",
+              label: "打开插件页",
+              run: () => { showView("plugins"); loadPlugins(); } },
+          ],
+        },
+      ],
+    },
+    {
+      title: "数据与信息",
+      items: [
+        {
+          key: "data", name: "数据与备份", desc: "配置文件位置",
+          icon: "amber", glyph: "▤",
+          rows: [
+            { name: "实例配置文件", desc: "所有实例设置保存在这里", type: "info",
+              get: () => "~/.config/dsh-launcher/instances.json" },
+            { name: "profile 补丁", desc: "插件启停等改动写在这里", type: "info",
+              get: () => `~/.dsh/profiles/${st.instance?.profile || "web"}/cordis.patch.yml` },
+            { name: "界面偏好", desc: "主题与自动启动开关存浏览器本地", type: "info",
+              get: () => "localStorage" },
+          ],
+        },
+        {
+          key: "security", name: "安全设置", desc: "进程与端口策略",
+          icon: "slate", glyph: "⛨",
+          rows: [
+            { name: "进程策略", desc: "只结束本后端派生的子进程", type: "info",
+              get: () => "从不 kill 外部进程" },
+            { name: "端口策略", desc: "端口被占用时的处理方式", type: "info",
+              get: () => "只提示，不抢占" },
+            { name: "插件安装", desc: "只在用户点击时执行", type: "info",
+              get: () => "不自动安装" },
+          ],
+        },
+        {
+          key: "about", name: "关于", desc: "版本与开源信息",
+          icon: "gray", glyph: "ⓘ",
+          rows: [
+            { name: "应用", desc: "DSHA Linux 桌面控制中心", type: "info",
+              get: () => "Tauri 2 + Java 后端" },
+            { name: "dsh 版本", desc: "当前安装的 @deepseek-ai/dsh", type: "info",
+              get: () => envItem("dsh") },
+            { name: "Node.js", desc: "运行时", type: "info",
+              get: () => envItem("node") },
+          ],
+        },
+      ],
+    },
+  ];
+
+  function envItem(name) {
+    const it = (settings.env?.items || []).find((x) => x.name === name);
+    if (!it) return "—";
+    return it.ok ? it.detail : "未找到";
   }
 
-  $("settingsButton")?.addEventListener("click", () => {
+  async function updateInstance(patch) {
     const it = st.instance;
-    $("setPort").value = it ? it.port : 3080;
-    $("setAutoPort").checked = it ? !!it.autoPort : true;
-    $("setFallback").checked = it ? it.portFallback !== false : true;
-    $("setAutoStart").checked = AUTO_START;
-    $("setAutoOpen").checked = AUTO_OPEN;
-    portNote.textContent = "";
-    $("settingsModal").showModal();
-    const p = it && !it.autoPort ? it.port : 3080;
-    checkPort(p);
-  });
-
-  let portTimer;
-  $("setPort")?.addEventListener("input", (e) => {
-    clearTimeout(portTimer);
-    portTimer = setTimeout(() => checkPort(e.target.value), 350);
-  });
-
-  $("settingsSaveBtn")?.addEventListener("click", async (e) => {
-    e.preventDefault();
-    const it = st.instance;
-    if (!it) return;
-    const autoPort = $("setAutoPort").checked;
-    const port = parseInt($("setPort").value, 10);
-    if (!autoPort && (!port || port < 1024 || port > 65535)) {
-      return toast("端口需在 1024–65535 之间");
-    }
+    if (!it) { toast("还没有实例"); return false; }
     try {
-      await api("/api/instances/update", {
-        id: it.id,
-        port: String(autoPort ? (port || 3080) : port),
-        autoPort: String(autoPort),
-        portFallback: String($("setFallback").checked)
+      await api("/api/instances/update", { id: it.id, ...patch });
+      Object.assign(it, patch);
+      if (patch.port !== undefined) it.port = parseInt(patch.port, 10);
+      if (patch.autoPort !== undefined) it.autoPort = patch.autoPort === "true";
+      if (patch.portFallback !== undefined) it.portFallback = patch.portFallback === "true";
+      toast("已保存");
+      return true;
+    } catch (err) {
+      toast("保存失败：" + err.message);
+      return false;
+    }
+  }
+
+  // ---- 首页渲染 ----
+  function renderSettingsHome(filter = "") {
+    const q = filter.trim().toLowerCase();
+    const groups = $("settingsGroups");
+    groups.replaceChildren();
+    let any = false;
+
+    SETTING_GROUPS.forEach((g) => {
+      const hits = g.items.filter((it) =>
+        !q || it.name.toLowerCase().includes(q) || it.desc.toLowerCase().includes(q));
+      if (!hits.length) return;
+      any = true;
+
+      const head = document.createElement("div");
+      head.className = "settings-group-heading";
+      head.innerHTML = `<span></span><i></i>`;
+      head.firstChild.textContent = g.title;
+      groups.appendChild(head);
+
+      const card = document.createElement("div");
+      card.className = "settings-group-card";
+      hits.forEach((it) => {
+        const row = document.createElement("button");
+        row.className = "settings-row";
+        row.type = "button";
+        row.innerHTML = `
+          <span class="settings-icon ${it.icon}">${it.glyph}</span>
+          <span class="settings-copy"><b></b><small></small></span>
+          <span class="settings-arrow">›</span>`;
+        row.querySelector("b").textContent = it.name;
+        row.querySelector("small").textContent = it.desc;
+        row.addEventListener("click", () => openSettingPage(it.key));
+        card.appendChild(row);
       });
-      // 启动器偏好存本地，不写进实例配置
-      AUTO_START = $("setAutoStart").checked;
-      AUTO_OPEN = $("setAutoOpen").checked;
-      localStorage.setItem("dsha.autoStart", AUTO_START ? "1" : "0");
-      localStorage.setItem("dsha.autoOpen", AUTO_OPEN ? "1" : "0");
-      await refresh();
-      $("settingsModal").close();
-      toast(autoPort ? "已保存：端口由系统自动分配" : `已保存：工作台端口 ${port}（重启后生效）`);
-    } catch (err) { toast("保存失败：" + err.message); }
+      groups.appendChild(card);
+    });
+
+    $("settingsEmpty").hidden = any;
+  }
+
+  async function settingsHome() {
+    settings.page = null;
+    $("settingsHome").hidden = false;
+    $("settingsDetail").hidden = true;
+    $("settingsSearch").value = "";
+    renderSettingsHome();
+    const badge = $("settingsProfileBadge");
+    if (badge) badge.textContent = `profile · ${st.instance?.profile || "web"}`;
+    if (!settings.env) {
+      try { settings.env = await api("/api/env"); } catch (_) { settings.env = { items: [] }; }
+    }
+  }
+
+  function openSettingPage(key) {
+    const item = SETTING_GROUPS.flatMap((g) => g.items).find((x) => x.key === key);
+    if (!item) return;
+    settings.page = key;
+    $("settingsHome").hidden = true;
+    $("settingsDetail").hidden = false;
+
+    const body = $("settingsDetailBody");
+    body.replaceChildren();
+
+    const h = document.createElement("h2");
+    h.textContent = item.name;
+    const sub = document.createElement("p");
+    sub.className = "settings-sub";
+    sub.textContent = item.desc;
+    body.append(h, sub);
+
+    const panel = document.createElement("div");
+    panel.className = "settings-panel";
+    item.rows.forEach((r) => panel.appendChild(settingRow(r)));
+    body.appendChild(panel);
+
+    const note = document.createElement("p");
+    note.className = "settings-note";
+    note.textContent = "改动立即写入实例配置，标注「需重启」的项在下次启动时生效。";
+    body.appendChild(note);
+  }
+
+  function settingRow(r) {
+    const row = document.createElement("div");
+    row.className = "settings-option";
+
+    const copy = document.createElement("div");
+    copy.className = "settings-option-copy";
+    const b = document.createElement("b");
+    b.textContent = r.name;
+    const small = document.createElement("small");
+    small.textContent = r.desc;
+    copy.append(b, small);
+    row.appendChild(copy);
+
+    const val = r.type === "info" ? null : r.get?.();
+
+    if (r.type === "info") {
+      const span = document.createElement("span");
+      span.className = "settings-value";
+      span.textContent = r.get?.() ?? "—";
+      row.appendChild(span);
+      return row;
+    }
+
+    if (r.type === "action") {
+      const btn = document.createElement("button");
+      btn.className = "settings-action";
+      btn.type = "button";
+      btn.textContent = r.label || "打开";
+      btn.addEventListener("click", () => r.run?.());
+      row.appendChild(btn);
+      return row;
+    }
+
+    if (r.type === "switch") {
+      const sw = document.createElement("input");
+      sw.type = "checkbox";
+      sw.className = "settings-switch";
+      sw.checked = !!val;
+      sw.addEventListener("change", async () => {
+        const ok = await r.set(sw.checked);
+        if (ok === false) sw.checked = !sw.checked;
+      });
+      row.appendChild(sw);
+      return row;
+    }
+
+    if (r.type === "select") {
+      const sel = document.createElement("select");
+      sel.className = "settings-input";
+      (r.options || []).forEach((o) => {
+        const opt = document.createElement("option");
+        opt.value = o;
+        opt.textContent = o;
+        if (o === val) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      sel.addEventListener("change", () => r.set(sel.value));
+      row.appendChild(sel);
+      return row;
+    }
+
+    // text / number
+    const input = document.createElement("input");
+    input.className = "settings-input";
+    input.type = r.type === "number" ? "number" : "text";
+    input.value = val ?? "";
+    if (r.type === "number") { input.min = "1024"; input.max = "65535"; }
+
+    if (r.check) {
+      const hint = document.createElement("small");
+      hint.className = "settings-hint";
+      copy.appendChild(hint);
+      let timer;
+      const run = async () => {
+        clearTimeout(timer);
+        timer = setTimeout(async () => {
+          const msg = await r.check(input.value);
+          hint.textContent = msg || "";
+        }, 350);
+      };
+      input.addEventListener("input", run);
+      run();
+    }
+
+    input.addEventListener("change", async () => {
+      const ok = await r.set(input.value);
+      if (ok === false) input.value = val ?? "";
+    });
+    row.appendChild(input);
+    return row;
+  }
+
+  $("settingsBack")?.addEventListener("click", () => settingsHome());
+  $("settingsSearch")?.addEventListener("input", (e) => renderSettingsHome(e.target.value));
+
+  // 左下角「⚙ 设置」与侧边栏「设置」都进同一个整页设置
+  $("settingsButton")?.addEventListener("click", () => {
+    showView("settings");
+    settingsHome();
   });
 
-  const settingsForm = $("settingsModal")?.querySelector("form");
-  if (settingsForm) settingsForm.addEventListener("submit", (e) => e.preventDefault());
+  // Ctrl+K 聚焦搜索，Esc 返回列表 —— 只在设置页生效
+  document.addEventListener("keydown", (e) => {
+    if ($("settingsView").hidden) return;
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      if (!settings.page) $("settingsSearch").focus();
+    }
+    if (e.key === "Escape" && settings.page) {
+      e.preventDefault();
+      settingsHome();
+    }
+  });
 
   // 主按钮内 spinner
   const style = document.createElement("style");
