@@ -52,20 +52,43 @@ async fn open_workbench(app: tauri::AppHandle, url: String) -> Result<(), String
 }
 
 fn backend_jar() -> PathBuf {
-    // 优先用应用资源目录里的 jar
+    // 找 dsh-backend.jar，按命中优先级排：
+    //   1. 可执行文件同目录            —— 便携 tar.gz 布局
+    //   2. Tauri 资源目录（deb 安装）  —— /usr/lib/DSHA 或 /usr/lib/com.dshlauncher.app
+    //   3. AppImage 挂载点下的资源目录 —— $APPDIR/usr/lib/...
+    //   4. 项目根目录                  —— 开发态（cargo 原生跑）
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("dsh-backend.jar");
-            if candidate.exists() {
-                return candidate;
+            candidates.push(dir.join("dsh-backend.jar"));
+            // AppImage：真身在 $APPDIR/usr/bin 里，资源在 $APPDIR/usr/lib
+            if let Some(appdir) = dir.parent().and_then(|d| d.parent()) {
+                candidates.push(appdir.join("usr/lib/dsh-backend.jar"));
+                candidates.push(appdir.join("usr/lib/DSHA/dsh-backend.jar"));
+                candidates.push(appdir.join("usr/lib/com.dshlauncher.app/dsh-backend.jar"));
             }
         }
     }
+    // deb 安装：资源在 /usr/lib/< productName | identifier >
+    candidates.push(PathBuf::from("/usr/lib/DSHA/dsh-backend.jar"));
+    candidates.push(PathBuf::from("/usr/lib/com.dshlauncher.app/dsh-backend.jar"));
     // 开发态：项目根目录
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("backend/dsh-backend.jar"),
+    );
+
+    for c in candidates {
+        if c.exists() {
+            return c;
+        }
+    }
+    // 都没有就返回开发态路径，让调用方给出「未找到」的日志
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join("backend/dsh-backend.jar");
-    dev
+        .join("backend/dsh-backend.jar")
 }
 
 fn spawn_backend() -> (Option<Child>, u16) {

@@ -37,6 +37,18 @@
       "icons/128x128.png",
       "icons/icon.png"
     ],
+    "resources": {
+      "../../backend/dsh-backend.jar": "dsh-backend.jar"
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "default-jre | openjdk-21-jre | openjdk-21-jre-headless",
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0"
+        ]
+      }
+    },
     "category": "Development",
     "shortDescription": "DeepSeek Harness 桌面管理器",
     "longDescription": "管理 dsh 实例的启动、停止、日志与配置"
