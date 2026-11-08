@@ -1,5 +1,26 @@
 # 迭代记录
 
+## v2.13 — 2026-11-08 · 修复点「启动 DSHA」无反应
+
+**问题**：后端启动成功后（端口可能顺延到 7081 等），前端点「启动 DSHA」
+毫无反应，日志也一直是空的。
+
+**根因**：后端在 `/api/health` 响应头里回写一次性令牌 `X-DSH-Token`，
+前端靠它给后续请求鉴权。但后端漏设了 `Access-Control-Expose-Headers`，
+WebView（origin 非 http）里 `fetch` 读不到这个非 CORS 安全响应头，
+`API_TOKEN` 恒为 null → 后续所有请求（含 `/api/instances/start`）都被
+`checkToken` 以 401 拦下 → 前端静默失败，看起来「没反应」。
+
+**改动**（`backend/src/com/dshlauncher/Backend.java`）
+- `cors()` 增加 `Access-Control-Expose-Headers: X-DSH-Token`。
+
+**关联**：本次一并提交了之前未入库的配套后端改动——
+启动令牌 `STARTUP_TOKEN` + CORS 白名单、全局 `checkToken` 鉴权、
+`/api/instances/health`（dsh 崩溃自动重启）、`/api/frontend-error`
+（前端异常上报 + 速率限制）。
+
+---
+
 ## v2.12 — 2026-11-08 · 修复关启动器关不掉 dsh
 
 **问题**：关掉启动器后 dsh 进程（及其 node 子进程树）仍留在后台，
