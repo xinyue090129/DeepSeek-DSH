@@ -49,7 +49,6 @@ DSHA 把这些收进一个桌面窗口：
 | **清单来自磁盘** | 直接读 profile 的 `package.json`、`node_modules` 与补丁里的 `disabled` 标记 |
 | **安装 / 升级** | 输入包名或 Git 地址，确认后执行一次 `pnpm add --save-exact`，失败自动回滚 |
 | **启停开关** | 改 `cordis.patch.yml` 里的 `disabled`，重启实例生效 |
-| **官方扩展发现** | 扫描全局 dsh 里带 `*-bundle` 的包，告诉你还能加什么 |
 | **不自动安装** | 启动、重启、轮询、环境检测等一切自动流程都不碰 npm / pnpm |
 
 ### 设置页
