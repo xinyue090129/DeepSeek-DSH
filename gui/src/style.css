@@ -320,6 +320,15 @@ body.light #pluginView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,1
   /* These extra prototype sections are not present in the reference dashboard. */
   .lower-panel, .tabs-panel { display: none; }
 }
+/* 701–1050px：恢复单列堆叠（上面 min-width:701 块的两列规则会覆盖 1050 断点，这里重新拉回），
+   并允许主区纵向滚动，避免内容被 100vh 裁掉。 */
+@media (min-width: 701px) and (max-width: 1050px) {
+  .dashboard-grid { grid-template-columns: 1fr; }
+  .right-column { display: grid; grid-template-columns: 1fr 1fr; align-items: start; }
+  .logs-section { grid-column: 1 / -1; margin-top: 0; }
+  .bottom-actions { grid-column: 1 / -1; }
+  .main-content { overflow-y: auto; }
+}
 @media (min-width: 701px) and (max-height: 760px) {
   .app-shell { grid-template-rows: 70px minmax(0, 1fr); }
   .topbar { min-height: 70px; }
