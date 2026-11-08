@@ -4,9 +4,12 @@
 
 **DeepSeek Harness 的 Linux 桌面启动器**
 
-一个窗口管完 dsh 的启动、端口、日志与工作台
+一个窗口管完 dsh 的启动、端口、日志、插件与工作台
 
 <sub>Tauri 2 · Rust · Java · 原生 Web，零前端框架</sub>
+
+![version](https://img.shields.io/badge/version-1.0.0-3b7dd8)
+![platform](https://img.shields.io/badge/platform-Linux-2ba471)
 
 </div>
 
@@ -21,10 +24,13 @@ DSHA 把这些收进一个桌面窗口：
 - 点一下启动，**端口和 token 自动解析**，工作台直接在应用内打开
 - 端口可自己指定，被占用了会告诉你，也能自动回退
 - 关掉窗口，**dsh 跟着一起退出**，不留孤儿进程
+- 插件安装、升级、启停都在界面里完成，**但绝不自动替你装**
 
 ---
 
 ## 特性
+
+### 控制中心
 
 | | |
 |---|---|
@@ -35,8 +41,32 @@ DSHA 把这些收进一个桌面窗口：
 | **应用内工作台** | 独立 WebView 窗口，不弹外部浏览器，复用窗口时自动换新 token |
 | **单实例保护** | 同一 profile 已有 dsh 在跑就拒绝启动，避免「会话已被占用」 |
 | **实时日志** | 增量拉取、token 打码、自动滚底、可回顶部 |
-| **环境自检** | dsh / node / npm / 浏览器 / 输入法 / 中文字体一次看清 |
-| **深色界面** | 整窗适配视口，桌面端不出现整页滚动条 |
+
+### 插件中心
+
+| | |
+|---|---|
+| **清单来自磁盘** | 直接读 profile 的 `package.json`、`node_modules` 与补丁里的 `disabled` 标记 |
+| **安装 / 升级** | 输入包名或 Git 地址，确认后执行一次 `pnpm add --save-exact`，失败自动回滚 |
+| **启停开关** | 改 `cordis.patch.yml` 里的 `disabled`，重启实例生效 |
+| **官方扩展发现** | 扫描全局 dsh 里带 `*-bundle` 的包，告诉你还能加什么 |
+| **不自动安装** | 启动、重启、轮询、环境检测等一切自动流程都不碰 npm / pnpm |
+
+### 设置页
+
+三组九项，**能真生效的才做成可编辑**：
+
+| 分组 | 条目 |
+|---|---|
+| 常规 | 基础设置 / DSH 设置 / 运行环境 |
+| 服务与扩展 | Web UI / 网络设置 / 插件设置 |
+| 数据与信息 | 数据与备份 / 安全设置 / 关于 |
+
+- **可改**：实例名、profile、启动模式、附加参数、工作目录、环境变量、补丁、Web 端口、自动分配、端口回退 —— 全部走 `/api/instances/update` 真写入
+- **只读**：Java 版本、会话类型、运行端口、dsh/node/edge/niri 实际路径、配置文件位置、进程与端口策略 —— 显示真实值，不给假开关
+- **本机偏好**：主题、自动启动、自动进入工作台 —— 存 `localStorage`
+
+支持搜索过滤、`Ctrl+K` 聚焦搜索、`Esc` 返回列表。
 
 ---
 
@@ -46,7 +76,7 @@ DSHA 把这些收进一个桌面窗口：
 ┌──────────────────────────────┐   HTTP    ┌───────────────────────────┐
 │  Tauri 壳（Rust + WebKitGTK） │ ────────▶ │  Java 后端（独立进程）      │
 │  窗口 · 渲染 · 拉起/回收后端   │  127.0.0.1 │  进程管理 · 日志 · 配置      │
-│  应用内工作台窗口             │  :7080..99│  端口探测 · 环境检测         │
+│  应用内工作台窗口             │  :7080..99│  端口探测 · 环境检测 · 插件  │
 └──────────────────────────────┘           └───────────────────────────┘
 ```
 
@@ -56,14 +86,30 @@ DSHA 把这些收进一个桌面窗口：
 
 ---
 
-## 快速开始
+## 安装
+
+### 方式一：下载发布包（推荐）
+
+从 [Releases](https://github.com/xinyue090129/DeepSeek-DSH/releases) 下载最新 `dsha-v1.0.0-linux-x64.tar.gz`，解压后：
 
 ```bash
-# 启动（Tauri 会自动拉起 Java 后端）
+tar -xzf dsha-v1.0.0-linux-x64.tar.gz
+cd dsha-v1.0.0
 ./dsh-launcher.sh
+```
 
-# 改完代码后完整重建
+需要系统已装 **JRE 21+** 与 **WebKitGTK 4.1**（见下方依赖）。
+
+### 方式二：从源码构建
+
+```bash
+git clone https://github.com/xinyue090129/DeepSeek-DSH.git
+cd DeepSeek-DSH
+
+# 一条命令：Java 编译打包 → cargo build --release
 ./scripts/build-tauri.sh
+
+./dsh-launcher.sh
 ```
 
 应用菜单里搜 **DSHA 控制中心** 也能打开。
@@ -80,17 +126,19 @@ DSHA 把这些收进一个桌面窗口：
 ├──────────┬─────────────────────────────────────────────┤
 │          │  CONTROL CENTER           ● 运行中          │
 │  ◈ DSHA  │  DSHA 控制中心                              │
-│  ⌕ 仪表盘│  ┌──────────────┐  ┌────────┐ ┌────────┐   │
-│  ♙ 项目  │  │  ●  ONLINE   │  │  端口   │ │ 运行时  │   │
+│  ⌕ 插件  │  ┌──────────────┐  ┌────────┐ ┌────────┐   │
+│  ♙ 设置  │  │  ●  ONLINE   │  │  端口   │ │ 运行时  │   │
 │          │  │   :38545     │  │ 38545  │ │ ACTIVE │   │
 │          │  │  ↗ 进入工作台 │  └────────┘ └────────┘   │
 │          │  └──────────────┘                           │
-│  ⚙ 设置  │  ── 快捷入口 ────────────────────────────    │
+│          │  ── 快捷入口 ────────────────────────────    │
 │          │  ── 启动日志 ─────────────────────────────   │
 │          │  [12:01:03] 正在启动 local-deepseek …       │
 │          │  [12:01:03] $ dsh --profile web --port 0    │
 └──────────┴─────────────────────────────────────────────┘
 ```
+
+三个视图：**控制中心** / **插件中心** / **设置**，侧边栏切换。
 
 ---
 
@@ -104,16 +152,20 @@ java -jar backend/dsh-backend.jar --port 7080
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/health` | 健康检查，附带外部 dsh 探测结果 |
+| GET | `/api/health` | 健康检查，附带外部 dsh 探测结果、`pluginAutoInstall:false` |
 | GET | `/api/instances` | 实例列表 |
 | POST | `/api/instances/add` | 新增实例 |
-| POST | `/api/instances/update` | 更新实例（端口 / 自动端口 / 回退策略） |
+| POST | `/api/instances/update` | 更新实例（端口 / 自动端口 / 回退策略 / profile / 环境变量等） |
 | POST | `/api/instances/delete` | 删除实例 |
 | POST | `/api/instances/start` | 启动 |
 | POST | `/api/start-safe` | 安全启动（跳过全部补丁） |
 | POST | `/api/instances/stop` | 停止（只结束本后端派生的进程树） |
 | POST | `/api/instances/restart` | 重启 |
 | GET | `/api/instances/logs?id=&since=` | 增量拉日志 |
+| GET | `/api/plugins` | 插件清单（读磁盘，只读） |
+| POST | `/api/plugins/install` | 安装插件（`pnpm add`，失败回滚） |
+| POST | `/api/plugins/uninstall` | 卸载插件 |
+| POST | `/api/plugins/toggle` | 启停插件（改 `cordis.patch.yml`） |
 | GET/POST | `/api/profile` | 读写 profile 补丁 |
 | GET | `/api/env` | 环境检测 |
 | GET | `/api/update` | 版本检查 |
@@ -135,6 +187,7 @@ curl -s "http://127.0.0.1:7080/api/port-check?port=3080"
 - **端口被占用只提示，不抢占。** 想避开就开「自动端口」，由系统分配。
 - **停止只终止本后端拉起的进程树。** 优先 `setsid` 独立进程组，`kill -- -PGID` 整组带走。
 - **关窗即清理。** SIGTERM → 等 4 秒 → 兜底 SIGKILL；后端 shutdown hook 再兜一层。
+- **插件不自动安装。** 启动、重启、轮询、环境检测都不碰 npm / pnpm；只有用户在界面上显式点击时，才调用 `/api/plugins/install`、`/api/plugins/uninstall` 或 `/api/plugins/toggle`。
 
 ---
 
@@ -147,12 +200,12 @@ dsh-launcher.png             图标
 
 backend/
   src/com/dshlauncher/
-    Backend.java             后端全部源码（单文件，约 1800 行）
+    Backend.java             后端全部源码（单文件，约 1700 行）
 
 gui/
   src/
-    index.html               界面结构
-    style.css                深色主题
+    index.html               界面结构（三个视图 + 两个弹窗）
+    style.css                深色主题（含浅色覆盖）
     app.js                   全部交互逻辑
   src-tauri/
     src/lib.rs               Tauri 壳：拉起后端、生命周期、工作台窗口
@@ -174,6 +227,7 @@ docs/
 | 实例配置 | `~/.config/dsh-launcher/instances.json` |
 | profile 补丁 | `~/.dsh/profiles/<profile>/cordis.patch.yml` |
 | 保存备份 | 同目录 `cordis.patch.yml.bak-<时间戳>` |
+| 界面偏好 | `localStorage`（主题、自动启动） |
 
 ---
 
@@ -207,6 +261,20 @@ cargo install tauri-cli
 
 ---
 
+## 已知限制
+
+- **Linux 专用。** 依赖 WebKitGTK 与 niri，未做 Windows / macOS 适配。
+- **单实例单 profile 编辑。** 多实例可并存，但界面一次聚焦一个。
+- **插件安装受网络影响。** `pnpm add` 走默认 registry，失败会自动回滚 `package.json` 与 `pnpm-lock.yaml`。
+
+---
+
+## 更新日志
+
+见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。当前版本 **v1.0.0** 汇总了 v2.9 之前的全部迭代。
+
+---
+
 <div align="center">
-<sub>界面版式源自 <code>DSHA-Linux-UI</code>（no-scroll 深色控制中心）</sub>
+<sub>界面版式源自 <code>DSHA-Linux-UI</code>（no-scroll 深色控制中心）· 设置页结构参考 <code>DSHA-PC-Settings</code></sub>
 </div>

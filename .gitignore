@@ -29,3 +29,4 @@ core.[0-9]*
 .probe*/
 .t*.py
 .fakedsh
+dist/
