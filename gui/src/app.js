@@ -1342,12 +1342,6 @@
   $("settingsBack")?.addEventListener("click", () => settingsHome());
   $("settingsSearch")?.addEventListener("input", (e) => renderSettingsHome(e.target.value));
 
-  // 左下角「⚙ 设置」与侧边栏「设置」都进同一个整页设置
-  $("settingsButton")?.addEventListener("click", () => {
-    showView("settings");
-    settingsHome();
-  });
-
   // Ctrl+K 聚焦搜索，Esc 返回列表 —— 只在设置页生效
   document.addEventListener("keydown", (e) => {
     if ($("settingsView").hidden) return;
