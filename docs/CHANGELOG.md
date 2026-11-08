@@ -1,5 +1,28 @@
 # 迭代记录
 
+## v2.9 — 2026-11-08 · 未运行时「停止」给提示、「重启」改为启动
+
+**问题**：实例没在跑的时候，「停止」「重启」两个按钮都是灰的、点不动，
+看着像坏了。
+
+**改动**
+- 两个按钮不再因 `stopped` 而禁用，只有 `busy`（正在执行别的动作）时才禁用。
+- **停止**：状态不是 `running` / `starting` 时，点击给出提示
+  「没有正在运行的进程，无需停止」，不改发请求。
+- **重启**：状态不是 `running` / `starting` 时，没有东西可重启，
+  点击直接改走启动流程（`/api/instances/start`），提示「当前未运行，正在启动 xxx…」。
+  **按钮文字和图标保持原样（`↻重启` / `□停止`），界面不做任何变化。**
+- `running` / `starting` 下行为与之前完全一致：停止发 `/api/instances/stop`
+  （`starting` 时可中断启动），重启发 `/api/instances/restart`。
+
+**验证**（jsdom）
+- 静态：两个按钮的 `textContent` 仍是 `↻重启` / `□停止`，HTML 未改动。
+- `stopped` / `error`：两者都 `disabled === false`，停止→提示、重启→start。
+- `running` / `starting`：停止→stop、重启→restart。
+- `busy`：两者都禁用。
+
+---
+
 ## v2.8 — 2026-11-07 · 设置页整页接入（真数据）
 
 把 `~/下载/DSHA-PC-Settings-B-优化版` 那套纯前端原型接进启动器。

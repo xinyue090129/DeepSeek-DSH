@@ -176,8 +176,10 @@
       btn.innerHTML = '<span class="play-icon">▶</span><span>启动 DSHA</span>';
     }
 
-    $("stopButton").disabled = st.busy || s === "stopped";
-    $("restartButton").disabled = st.busy || s === "stopped";
+    // 未运行时这两个按钮**不禁用**，靠点击后给提示/改走启动，
+    // 免得界面上摆两个点不动的灰按钮让人以为坏了。
+    $("stopButton").disabled = st.busy;
+    $("restartButton").disabled = st.busy;
     $("safeStartButton").disabled = st.busy || running;
 
     // 日志行数放在标题右侧，长跑时也能看出流有没有在动
@@ -395,7 +397,18 @@
     if (AUTO_OPEN) watchReadyToOpen();
   });
 
+  /**
+   * 停止。没在跑的时候不静默失败，也不禁用按钮，
+   * 而是明确说一句「没有可停止的进程」，让人知道点到了但确实无事可做。
+   */
   $("stopButton").addEventListener("click", () => {
+    const it = st.instance;
+    if (!it) return toast("没有可用实例");
+
+    if (it.state !== "running" && it.state !== "starting") {
+      return toast("没有正在运行的进程，无需停止");
+    }
+
     const target = currentId(); if (!target) return;
     act(async () => {
       stopWatch();
@@ -426,7 +439,35 @@
     return null;
   }
 
+  /** 未运行时「重启」按钮的实际行为：走启动流程，文案按启动说。 */
+  function startFromRestartButton() {
+    const it = st.instance;
+    if (!it) return toast("没有可用实例");
+    act(async () => {
+      const target = currentId(); if (!target) return;
+      it.state = "starting";
+      st.since = 0;
+      st.localOffset = 0;
+      render();
+      await api("/api/instances/start", { id: target });
+      toast("当前未运行，正在启动 " + it.name + "…");
+      await poll();
+    });
+    if (AUTO_OPEN) watchReadyToOpen();
+  }
+
+  /**
+   * 重启。没在跑的时候没有东西可重启 —— 此时直接当作「启动」来执行，
+   * 但按钮文字仍然是「重启」，界面上不做任何变化。
+   */
   $("restartButton").addEventListener("click", () => {
+    const it = st.instance;
+    if (!it) return toast("没有可用实例");
+
+    if (it.state !== "running" && it.state !== "starting") {
+      return startFromRestartButton();
+    }
+
     const target = currentId(); if (!target) return;
     act(async () => {
       stopWatch();
