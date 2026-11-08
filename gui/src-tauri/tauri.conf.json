@@ -30,6 +30,7 @@
     "active": true,
     "targets": [
       "deb",
+      "rpm",
       "appimage"
     ],
     "icon": [
