@@ -185,30 +185,37 @@ pub fn run() {
             child: Mutex::new(child),
             port: std::sync::atomic::AtomicU16::new(port),
         })
+        // 主窗口点 × 时直接退出整个应用（而不是只关窗口留后台），
+        // 这样 ExitRequested/Exit 会触发，后端和 dsh 才能被可靠回收。
+        .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                window.app_handle().exit(0);
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             backend_alive,
             restart_backend,
             backend_port,
             open_workbench
         ])
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                if let Some(state) = window.try_state::<BackendProc>() {
-                    let taken = state.child.lock().unwrap().take();
-                    shutdown_backend(taken);
-                }
-            }
-        })
         .build(tauri::generate_context!())
         .expect("Tauri 启动失败");
 
     app.run(|handle, event| {
-        // 主事件循环退出（关窗 / 退出应用）时再兜一次，避免漏网
-        if let tauri::RunEvent::Exit = event {
-            if let Some(state) = handle.try_state::<BackendProc>() {
-                let taken = state.child.lock().unwrap().take();
-                shutdown_backend(taken);
+        // 统一在这里回收后端，避免 on_window_event 里多窗口（主窗 / 工作台窗）
+        // 各自销毁时提前或重复触发 shutdown，导致后端/ dsh 漏杀或误杀。
+        //
+        // ExitRequested：用户关主窗口（或显式退出）时最先到达，
+        //   此时立即 SIGTERM 后端，让它的 shutdown hook 用 killTree 带走 dsh 整组。
+        // Exit：事件循环真正结束时兜底再拿一次（take 保证幂等，不会重复）。
+        match event {
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                if let Some(state) = handle.try_state::<BackendProc>() {
+                    let taken = state.child.lock().unwrap().take();
+                    shutdown_backend(taken);
+                }
             }
+            _ => {}
         }
     });
 }
