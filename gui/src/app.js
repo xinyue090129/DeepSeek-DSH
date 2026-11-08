@@ -781,57 +781,6 @@
     }
     $("installedCount").textContent = marketItems.length;
 
-    // 官方可选扩展：随 dsh 分发但本 profile 没装载的能力包
-    const avail = plug.available || [];
-    const availList = $("availableList");
-    availList.replaceChildren();
-    if (!avail.length) {
-      const d = document.createElement("div");
-      d.className = "plugin-empty";
-      d.textContent = plug.loading ? "读取中…" : "没有发现未装载的官方扩展";
-      availList.appendChild(d);
-    } else {
-      avail.forEach((a) => {
-        const card = document.createElement("article");
-        card.className = "plugin-card";
-
-        const logo = document.createElement("div");
-        logo.className = "plugin-logo official";
-        logo.textContent = (a.name.split("/").pop() || "?")
-          .replace(/^dsh-/, "").replace(/-bundle$/, "").slice(0, 1).toUpperCase();
-
-        const body = document.createElement("div");
-        body.className = "plugin-body";
-        const title = document.createElement("div");
-        title.className = "plugin-title";
-        const nm = document.createElement("span");
-        nm.className = "plugin-name";
-        nm.textContent = a.name;
-        title.appendChild(nm);
-        if (a.version) {
-          const v = document.createElement("span");
-          v.className = "plugin-version";
-          v.textContent = "v" + a.version;
-          title.appendChild(v);
-        }
-        const desc = document.createElement("div");
-        desc.className = "plugin-desc";
-        desc.textContent = a.description || "（该包未提供 description）";
-        body.append(title, desc);
-
-        const ctrl = document.createElement("div");
-        ctrl.className = "plugin-ctrl";
-        const badge = document.createElement("span");
-        badge.className = "tag off";
-        badge.textContent = "未装载";
-        ctrl.appendChild(badge);
-
-        card.append(logo, body, ctrl);
-        availList.appendChild(card);
-      });
-    }
-    $("availableCount").textContent = avail.length;
-
     // 管理页：搜索 + 状态筛选
     const listItems = all.filter((p) => {
       if (q && !(p.name + " " + (p.description || "")).toLowerCase().includes(q)) return false;
@@ -866,7 +815,6 @@
       plug.items = Array.isArray(r.items) ? r.items : [];
       plug.profile = r.profile || "";
       plug.writable = !!r.writable;
-      plug.available = Array.isArray(r.availableItems) ? r.availableItems : [];
       plug.loaded = true;
     } catch (e) {
       plug.items = [];
