@@ -64,6 +64,26 @@ public class Backend {
     static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("HH:mm:ss");
     static final int DEFAULT_PORT = 7080;
     static final int MAX_LOG_LINES = 4000;
+    /** 启动时生成的一次性访问令牌，前端首次请求 /api/health 时获取，随后每次请求携带 X-DSH-Token 头。 */
+    static final String STARTUP_TOKEN = java.util.UUID.randomUUID().toString().replace("-", "");
+    /** 已验证过 token 的前端来源（CORS 白名单，避免 * 的过宽松）。 */
+    static final Set<String> ALLOWED_ORIGINS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "tauri://localhost",
+            "http://127.0.0.1",
+            "http://127.0.0.1:7080",
+            "http://127.0.0.1:7081",
+            "http://127.0.0.1:7082",
+            "http://127.0.0.1:7083",
+            "http://127.0.0.1:7084",
+            "http://127.0.0.1:7085",
+            "http://127.0.0.1:7086",
+            "http://127.0.0.1:7087",
+            "http://127.0.0.1:7088",
+            "http://127.0.0.1:7089"
+    ));
+    /** 前端异常上报速率限制：同一来源最多 50 条，防日志被刷爆。 */
+    static final int MAX_FRONTEND_ERRORS = 50;
+    static int frontendErrorCount = 0;
 
     // ---------------- 模型 ----------------
     static class Instance {
@@ -207,6 +227,9 @@ public class Backend {
                     return;
                 }
 
+                // 所有路由都需要 X-DSH-Token 头，/api/health 除外（前端先拿 token）
+                if (!checkToken(ex)) return;
+
                 switch (path) {
                     // 插件安装 / 卸载：只响应用户的显式请求，绝不由启动流程自动调用。
                     // 参数：{"spec":"包名或仓库","profile":"web","registry":"npm|mirror","enabled":true}
@@ -271,11 +294,14 @@ public class Backend {
                               .append(",\"cmd\":\"").append(esc(foreign.get(k)[1])).append("\"}");
                         }
                         fb.append(']');
-                        ok(ex, "{\"ok\":true,\"name\":\"dsh-backend\",\"version\":\"1.0.0\","
+                        String healthBody = "{\"ok\":true,\"name\":\"dsh-backend\",\"version\":\"1.0.0\","
                                 + "\"instances\":" + inst.size()
                                 + ",\"pluginAutoInstall\":false"
                                 + ",\"instanceProfile\":\"" + esc(inst.isEmpty() ? "" : inst.get(0).profile) + "\""
-                                + ",\"foreignDsh\":" + fb + "}");
+                                + ",\"foreignDsh\":" + fb + "}";
+                        // 健康检查响应头带上一次性启动令牌，前端首次访问后缓存并用于后续请求
+                        ex.getResponseHeaders().add("X-DSH-Token", STARTUP_TOKEN);
+                        ok(ex, healthBody);
                         return;
                     }
 
@@ -496,6 +522,53 @@ public class Backend {
                         boolean inUse = p > 0 && isPortOpen(p);
                         ok(ex, "{\"port\":" + p + ",\"inUse\":" + inUse
                                 + ",\"ok\":" + (p > 1023 && p < 65536 && !inUse) + "}");
+                        return;
+                    }
+
+                    // 实例健康检查：检查 dsh 进程是否还在运行，如果不在了自动尝试重启
+                    case "/api/instances/health": {
+                        Instance t = find(jsonVal(body, "id"));
+                        if (t == null) {
+                            ok(ex, "{\"ok\":false,\"error\":\"找不到实例\"}");
+                            return;
+                        }
+                        boolean processAlive = t.proc != null && t.proc.isAlive();
+                        boolean portAlive = t.actualPort > 0 && isPortOpen(t.actualPort);
+                        boolean healthy = processAlive && portAlive;
+                        if (!healthy && t.state.equals("running")) {
+                            // dsh 意外崩溃了，尝试自动重启
+                            addLog(t, "检测到 dsh 进程已停止，尝试自动重启...");
+                            stopInstance(t); // 清理残留
+                            t.state = "starting";
+                            t.actualPort = -1;
+                            t.workbenchUrl = "";
+                            startInstance(t);
+                            ok(ex, "{\"ok\":true,\"healthy\":false,\"autoRestarted\":true,\"message\":\"dsh 已崩溃，正在自动重启\"}");
+                        } else {
+                            ok(ex, "{\"ok\":true,\"healthy\":" + healthy
+                                    + ",\"autoRestarted\":false,\"state\":\"" + t.state + "\"}");
+                        }
+                        return;
+                    }
+
+                    // 前端异常上报：DSHA 风格的启动观察器会把 JS 异常、未处理拒绝、
+                    // 插件加载失败等发到这里。只记录，不做业务处理，且有速率限制。
+                    case "/api/frontend-error": {
+                        if (frontendErrorCount >= MAX_FRONTEND_ERRORS) {
+                            err(ex, "前端错误上报已达上限，暂停接收");
+                            return;
+                        }
+                        Map<String, String> d = flatJson(body);
+                        String type = d.getOrDefault("type", "issue");
+                        String id = d.getOrDefault("id", "");
+                        String msg = d.getOrDefault("message", "");
+                        boolean fatal = "true".equals(d.getOrDefault("fatal", "false"));
+                        String nonce = d.getOrDefault("nonce", "");
+                        String docId = d.getOrDefault("documentId", "");
+                        frontendErrorCount++;
+                        System.out.println("[DSHA_FRONTEND] " + type + " | " + id + " | " + msg
+                                + (fatal ? " [FATAL]" : "") + " | doc=" + docId + " nonce=" + nonce);
+                        ok(ex, "{\"ok\":true,\"received\":" + frontendErrorCount + "}");
                         return;
                     }
 
@@ -1528,19 +1601,45 @@ public class Backend {
         try (OutputStream os = ex.getResponseBody()) { os.write(b); }
     }
 
-    /** 统一 CORS：WebView 的 origin 是 tauri://localhost，跨域访问本地 HTTP 必须显式放行。 */
+    /** 统一 CORS：仅放行本地来源与 Tauri 壳，避免 * 的过宽松。 */
     static void cors(HttpExchange ex) {
+        String origin = ex.getRequestHeaders().getFirst("Origin");
+        if (origin != null && ALLOWED_ORIGINS.contains(origin)) {
+            ex.getResponseHeaders().add("Access-Control-Allow-Origin", origin);
+        } else {
+            // 非浏览器直接调用（如 curl）无 Origin 头，允许但不设置 CORS 头
+            ex.getResponseHeaders().add("Access-Control-Allow-Origin", "null");
+        }
         ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
-        ex.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
         ex.getResponseHeaders().add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        ex.getResponseHeaders().add("Access-Control-Allow-Headers", "Content-Type");
+        ex.getResponseHeaders().add("Access-Control-Allow-Headers", "Content-Type, X-DSH-Token");
+        // 关键：把 X-DSH-Token 响应头暴露给前端，否则 WebView（origin 非 http）里
+        // fetch 读不到这个非 CORS 安全头，API_TOKEN 永远拿不到，后续请求全 401。
+        ex.getResponseHeaders().add("Access-Control-Expose-Headers", "X-DSH-Token");
         ex.getResponseHeaders().add("Access-Control-Max-Age", "86400");
     }
 
+    /** 校验 X-DSH-Token 头。首次访问 /api/health 时不带 token 也放行，让前端先拿到 token。 */
+    static boolean checkToken(HttpExchange ex) throws IOException {
+        String path = ex.getRequestURI().getPath();
+        if ("/api/health".equals(path)) return true; // 健康检查免鉴权，前端先拿 token
+        String token = ex.getRequestHeaders().getFirst("X-DSH-Token");
+        if (token == null || !token.equals(STARTUP_TOKEN)) {
+            err(ex, 401, "401 未授权：缺少或错误的 X-DSH-Token 头，请先访问 /api/health 获取令牌");
+            return false;
+        }
+        return true;
+    }
+
     static void err(HttpExchange ex, String msg) throws IOException {
+        err(ex, 500, msg);
+    }
+
+    /** 指定状态码的错误响应（401 鉴权失败、404 等）。 */
+    static void err(HttpExchange ex, int status, String msg) throws IOException {
         byte[] b = ("{\"error\":\"" + esc(msg) + "\"}").getBytes(StandardCharsets.UTF_8);
         cors(ex);
-        ex.sendResponseHeaders(500, b.length);
+        ex.sendResponseHeaders(status, b.length);
         try (OutputStream os = ex.getResponseBody()) { os.write(b); }
     }
 
