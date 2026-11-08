@@ -123,12 +123,10 @@ body.light .log-live { color: #1f8b58; }
 body.light .log-live.offline { color: #7b8794; }
 .log-window { min-height: 220px; max-height: 310px; overflow: auto; padding: 20px 21px; border-radius: 17px; background: linear-gradient(145deg,#10151c,#11161d); color: #d1d9e2; font: 13px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace; border: 1px solid rgba(255,255,255,.035); }
 .log-line { white-space: pre-wrap; overflow-wrap: anywhere; }
-.log-line.info { color: #c5d6ed; }
-.log-line.success { color: #6ed9a6; }
-.log-line.warn { color: #efc36e; }
-.log-line.error { color: #ff8189; }
-.log-line.muted { color: #aab4c0; }
-.log-line.time { color: #6c7c92; }
+/* 日志统一用一种颜色（用户要求）：分类类名保留在 DOM 上，
+   但不再分类着色，深浅主题各给一个统一色。 */
+.log-line, .log-line.info, .log-line.success, .log-line.warn,
+.log-line.error, .log-line.muted, .log-line.time { color: #d1d9e2; }
 .bottom-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .bottom-actions .secondary-button { min-height: 66px; font-size: 15px; }
 .tabs-panel { margin-top: 24px; padding: 0 22px 18px; }
@@ -163,6 +161,9 @@ body.light {
 body.light .topbar { background: rgba(248,250,253,.96); }
 body.light .panel { background: #fff; }
 body.light .log-window { background: #f4f7fb; color: #263445; }
+body.light .log-line, body.light .log-line.info, body.light .log-line.success,
+body.light .log-line.warn, body.light .log-line.error, body.light .log-line.muted,
+body.light .log-line.time { color: #263445; }
 body.light .secondary-button { background: #f8fafc; }
 body.light .nav-item.active { color: #17304e; background: #dce9fb; }
 body.light .modal { background: #fff; }
