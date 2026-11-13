@@ -1,5 +1,29 @@
 # 迭代记录
 
+## v2.17 — 2026-11-13 · 布局塌陷修复 + 布局回归检查
+
+**问题**：控制中心整体不撑满窗口（底部一大片空白），日志框在部分宽度下被压成窄条，
+底部两个按钮缩在左下角。
+
+**两个根因**
+1. `#consoleView` 是 `.main-content` 与 `.dashboard-grid` 之间的普通 div，没有高度，
+   导致 grid 的 `flex: 1 1 auto` 失去参照 → 整页只按内容高度排布（实测 grid 512px / 主区 818px）。
+2. `@media (max-width:1050px)` 里的 `.right-column { align-items: start }` 残留到了
+   后续的 flex 布局上，把日志框、按钮组压成内容宽度（实测日志框 110px / 列宽 300px）。
+
+**改动**（`gui/src/style.css`）
+- `@media (min-width:701px)` 内给 `#consoleView` 补 `display:flex; flex-direction:column;
+  flex:1 1 auto; min-height:0`，让 grid 真正吃掉剩余高度。
+- 701–1050px 断点显式 `align-items: stretch`，并清掉 `grid-column` 残留。
+
+**新增工具**：`scripts/check-layout.sh`
+- 无头 Firefox 多尺寸渲染 + 注入断言，ImageMagick 采样判色 → PASS/FAIL，退出码可直接进 CI。
+- 断言项：整页无纵横滚动、日志框/按钮组宽度等于列宽、`#consoleView` 撑满主区。
+- 覆盖 `1180x780 / 1180x900 / 940x1000 / 800x600 / 1440x900 / 1600x1000`，当前全绿。
+- 已做负向测试：故意改回 `align-items: start`，脚本能 FAIL 并留下截图。
+
+---
+
 ## v2.16 — 2026-11-13 · 控制中心整页不出现纵向滚动
 
 **需求**：控制中心（仪表盘）整页不要上下滑动。
