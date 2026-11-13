@@ -40,6 +40,8 @@ async fn open_workbench(app: tauri::AppHandle, url: String) -> Result<(), String
     let parsed = url.parse::<tauri::Url>().map_err(|e| e.to_string())?;
     let win = WebviewWindowBuilder::new(&app, "workbench", WebviewUrl::External(parsed))
         .title("DSH 工作台")
+        .inner_size(1280.0, 860.0)
+        .min_inner_size(800.0, 600.0)
         .resizable(true)
         .background_color(tauri::window::Color(9, 11, 14, 255))
         .build()

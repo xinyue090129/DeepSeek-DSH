@@ -11,6 +11,10 @@
     "windows": [
       {
         "title": "DSHA · 控制中心",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 800,
+        "minHeight": 600,
         "resizable": true,
         "center": true,
         "decorations": true,
