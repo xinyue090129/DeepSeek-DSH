@@ -301,15 +301,19 @@ body.light #pluginView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,1
   .environment-card { min-height: clamp(78px, 9.5vh, 94px); }
   .logs-section {
     min-height: 0;
-    flex: 1 1 auto;
+    /* 日志区不再弹性撑满：固定高度，内容多就在框内滚动，
+       避免日志多少/窗口高度变化时把同列其它卡片挤压变形。 */
+    flex: 0 0 auto;
     display: flex;
     flex-direction: column;
     margin-top: clamp(4px, 1vh, 10px);
   }
   .log-window {
+    /* 固定可视高度（随视口小幅自适应，但不再被 flex 拉伸） */
+    height: clamp(180px, 26vh, 300px);
     min-height: 0;
-    max-height: none;
-    flex: 1 1 auto;
+    max-height: clamp(180px, 26vh, 300px);
+    flex: 0 0 auto;
     overflow-y: auto;
     overflow-x: hidden;
     scrollbar-gutter: stable;
@@ -771,3 +775,50 @@ body.light .warning-box p { color: #8a6a2c; }
   .action-tile { flex: 1 1 220px; }
   .security-note { flex-basis: 100%; }
 }
+
+/* =====================================================================
+   深浅层次优化（保持之前的简洁界面，只调明暗对比）
+   —— 背景压暗、卡片提亮、描边清晰、日志区凹陷
+   ===================================================================== */
+:root {
+  --bg: #05070b;          /* 背景更深，拉开与卡片的距离 */
+  --surface: #1a1f27;
+  --surface-2: #131820;
+}
+html, body { background: var(--bg); }
+
+/* 卡片：明显亮于背景 + 清晰描边 + 柔和阴影 */
+.panel {
+  background: linear-gradient(145deg, #1e242c, #161b22);
+  border: 1px solid rgba(255, 255, 255, .10);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, .30), inset 0 1px 0 rgba(255, 255, 255, .04);
+}
+
+/* 日志窗口：比卡片更暗，形成「压下去」的层次 */
+.log-window {
+  background: linear-gradient(145deg, #0b0f14, #090c11);
+  border: 1px solid rgba(255, 255, 255, .07);
+  box-shadow: inset 0 2px 10px rgba(0, 0, 0, .35);
+}
+
+/* 指标卡 / 快捷入口 / 环境卡跟随卡片层次，hover 时轻微提亮 */
+.metric-card:hover,
+.link-card:hover,
+.readiness-card:hover,
+.environment-card:hover {
+  background: linear-gradient(145deg, #232a33, #1a2028);
+}
+
+/* 主按钮保持原有蓝色，略加一点阴影，让它在深色底上更立体 */
+.primary-button {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .30), 0 8px 24px rgba(61, 126, 232, .22);
+}
+
+/* 浅色主题不受影响：覆盖回浅色 */
+body.light { background: #edf1f6; }
+body.light .panel {
+  background: #fff;
+  border-color: rgba(70, 86, 105, .18);
+  box-shadow: 0 12px 32px rgba(26, 44, 67, .07);
+}
+body.light .log-window { background: #f4f7fb; border-color: rgba(70, 86, 105, .14); }
