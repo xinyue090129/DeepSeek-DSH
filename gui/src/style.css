@@ -269,6 +269,15 @@ body.light #pluginView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,1
     flex: 0 0 auto;
     margin: 0 0 clamp(12px, 1.8vh, 20px);
   }
+  /* #consoleView 是 .main-content 与 .dashboard-grid 之间的普通 div。
+     不把它也变成「填满高度的 flex 列」，grid 的 flex:1 就没有参照，
+     整页会只按内容高度排布，底部留一大片空白、日志也涨不起来。 */
+  #consoleView {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
   .dashboard-grid {
     flex: 1 1 auto;
     min-height: 0;
@@ -301,18 +310,19 @@ body.light #pluginView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,1
   .environment-card { min-height: clamp(78px, 9.5vh, 94px); }
   .logs-section {
     min-height: 0;
-    /* 让日志区吸收剩余高度（不够时收缩），这样整页永远不需要滚动；
-       上限由 .log-window 的 max-height 控制，不会无限长高。 */
+    /* 让日志区吸收剩余高度，整页刚好填满视口、不出现纵向滚动 */
     flex: 1 1 auto;
     display: flex;
     flex-direction: column;
     margin-top: clamp(4px, 1vh, 10px);
   }
+  /* 除日志区外的卡片固定自身高度，避免被 flex 压缩变形 */
+  .left-column > *:not(.logs-section),
+  .right-column > *:not(.logs-section) { flex: 0 0 auto; }
   .log-window {
-    /* 高度随剩余空间伸缩，但限制在 120–300px 区间：
-       既不会把同列卡片挤变形，也不会让页面出现纵向滚动。 */
+    /* 高度吃掉剩余空间；空间不足时靠 min-height 托底由内层滚动消化 */
     min-height: 120px;
-    max-height: clamp(180px, 26vh, 300px);
+    max-height: none;
     flex: 1 1 auto;
     overflow-y: auto;
     overflow-x: hidden;
@@ -329,8 +339,14 @@ body.light #pluginView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,1
 @media (min-width: 701px) and (max-width: 1050px) {
   .app-shell { grid-template-columns: 220px minmax(0, 1fr); }
   .dashboard-grid { grid-template-columns: minmax(0, 1fr) minmax(272px, .82fr); }
-  .right-column { display: flex; flex-direction: column; }
-  .logs-section, .bottom-actions { margin-top: 0; }
+  /* 必须显式 stretch：上一段 ≤1050 的规则留了 align-items: start，
+     会让右列的日志框 / 底部按钮缩成内容宽度（正是布局错乱的根因）。 */
+  .right-column {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .logs-section, .bottom-actions { grid-column: auto; margin-top: 0; }
   .main-content { overflow: hidden; }
 }
 @media (min-width: 701px) and (max-height: 760px) {
