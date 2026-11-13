@@ -317,8 +317,10 @@ body.light #pluginView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,1
     margin-top: clamp(4px, 1vh, 10px);
   }
   /* 除日志区外的卡片固定自身高度，避免被 flex 压缩变形 */
-  .left-column > *:not(.logs-section),
   .right-column > *:not(.logs-section) { flex: 0 0 auto; }
+  /* 左列没有日志那种「吸收剩余高度」的元素，改成让卡片按比例分摊多余高度，
+     保证整列铺满窗口、底部不留空白（hero 与指标卡各自略微长高）。 */
+  .left-column > *:not(.logs-section) { flex: 1 1 auto; }
   .log-window {
     /* 高度吃掉剩余空间；空间不足时靠 min-height 托底由内层滚动消化 */
     min-height: 120px;

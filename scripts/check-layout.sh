@@ -28,8 +28,8 @@ HTML="$ROOT/gui/src/index.html"
 CSS="$ROOT/gui/src/style.css"
 PROBE="$OUT/probe.html"
 
-# 覆盖窗口尺寸默认尺寸(1180x780)、最小尺寸(800x600)、高窄、宽扁等边界
-SIZES_DEFAULT="1180x780 1180x900 940x1000 800x600 1440x900 1600x1000"
+# 覆盖窗口默认尺寸(1180x780)、最小尺寸(980x680)、高窄、宽扁等边界
+SIZES_DEFAULT="1180x780 1180x900 940x1000 980x680 1440x900 1600x1000"
 
 mkdir -p "$OUT"
 
@@ -75,6 +75,24 @@ probe = r"""
     if (cv.height < inner * 0.75) fails.push("consoleView 未撑满 " + Math.round(cv.height) + "/" + Math.round(inner));
     else notes.push("consoleView " + Math.round(cv.height) + " OK");
   }
+
+  // 6. 内容不得被窗口裁掉：两列最底部元素必须落在视口内（主区 overflow:hidden，
+  //    一旦高度不够就会被直接切掉，肉眼不一定会立刻发现）
+  function checkBottom(colSel, label){
+    var col = document.querySelector(colSel);
+    if (!col) return;
+    var kids = col.children;
+    for (var i = kids.length - 1; i >= 0; i--) {
+      var r = kids[i].getBoundingClientRect();
+      if (r.height < 4) continue;                       // 跳过隐藏元素
+      if (r.bottom > window.innerHeight - 1) {
+        fails.push(label + " 底部超出视口 " + Math.round(r.bottom) + ">" + window.innerHeight);
+      } else notes.push(label + " 底部 " + Math.round(r.bottom) + " OK");
+      break;
+    }
+  }
+  checkBottom(".left-column", "左列");
+  checkBottom(".right-column", "右列");
 
   // 结果上色
   var ok = fails.length === 0;
