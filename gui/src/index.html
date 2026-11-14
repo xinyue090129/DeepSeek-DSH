@@ -58,6 +58,12 @@
               <button class="secondary-button" id="restartButton"><span class="button-symbol">↻</span>重启</button>
               <button class="secondary-button" id="stopButton"><span class="button-symbol">□</span>停止</button>
             </div>
+
+            <!-- 会话接管：adopted / conflict / unknown 三种状态的操作区 -->
+            <div class="session-bar" id="sessionBar" hidden>
+              <p class="session-note" id="sessionNote"></p>
+              <div class="session-actions" id="sessionActions"></div>
+            </div>
           </article>
 
           <div class="metric-grid">
@@ -105,10 +111,15 @@
           <section class="logs-section">
             <div class="logs-heading">
               <h3>启动日志</h3>
-
+              <span class="log-tools">
+                <span class="log-live offline" id="logLive"><i></i><span id="logLiveText">未连接</span></span>
+                <span class="log-count" id="logCount"></span>
+                <button class="log-copy" id="logCopy" type="button" title="复制完整日志">复制</button>
+              </span>
             </div>
+            <div class="stage-list" id="stageList" hidden></div>
             <div class="log-window" id="logWindow" aria-live="polite">
-              <div class="log-line muted">等待启动…</div>
+              <div class="log-line muted" id="logPlaceholder">等待启动…</div>
             </div>
           </section>
 

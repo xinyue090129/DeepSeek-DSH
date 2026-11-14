@@ -17,7 +17,7 @@ mkdir -p "$BUILD_TMP"
 TMPDIR="$BUILD_TMP" javac \
     -J-Xmx96m -J-XX:MaxMetaspaceSize=64m \
     -J-XX:CompressedClassSpaceSize=32m -J-XX:ReservedCodeCacheSize=24m \
-    -encoding UTF-8 -d backend/out backend/src/com/dshlauncher/Backend.java
+    -encoding UTF-8 -d backend/out backend/src/com/dshlauncher/*.java
 
 echo ">>> [2/4] 打包 dsh-backend.jar"
 # jar 工具是独立的 JVM，默认 metaspace 预留很大，在这台机器上会 mmap 失败。

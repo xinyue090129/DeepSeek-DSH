@@ -1,5 +1,131 @@
 # 迭代记录
 
+## v2.20 — 2026-11-13 · 启动日志改按阶段呈现（移植 DSHA 的结构化时间线）
+
+**需求**：启动日志太吵、看不清走到哪一步。对齐 DSHA(Android) 的做法重做。
+
+**两个关键判断（决定了实现方式）**
+- 上游**不做关键词过滤**。`grep -rn ExperimentalWarning` 在 DSHA 主源码里是空的。
+  它靠的是**结构化分类 + 按阶段折叠**，不是把看不懂的行丢掉 —— 丢掉就等于毁证据。
+  本版因此删掉了此前那版草稿里的 `isNoisyDshLine()`（按关键字吞行）。
+- 上游折叠时要求**正文完全一致**才合并（`LogCompactor`）。数字和路径本身是诊断信息，
+  「端口 7080」和「端口 7081」是两件事，归一化成 `#` 再合并就丢了关键区别。
+
+**新增（移植自 DSHA，均为纯逻辑类）**
+- `StartupTrace`：有界（48KB / 300 行）结构化时间线。行带 `kind`
+  （OUTPUT / OWNED / STAGE_START / STAGE_DONE / STAGE_LEFT），阶段用 kind 表达，
+  界面不用匹配中文文案；`append` 时渲染结果与上一行相同直接丢弃（天然去重）；
+  `issue()` 单独记录问题供概览上浮；双上限环形裁剪并记 `dropped`。
+- `StartupLogDigest`：只按 `kind` 分组，产出 `Stage{name,startMs,durationMs,state,items}`
+  与逐行 `LineClass`（STAGE / TIMING / NOTE / WARN / BAD）。失败时最后一个阶段判 BAD。
+- `LogCompactor`：只压缩显示副本；连续且正文完全相同才折叠，带首末时间戳与 `×N`。
+- `SensitiveData`：私钥 / Bearer / api_key / password 打码，家目录缩成 `~`。
+  **launch token 不打码** —— 它是 127.0.0.1 上的一次性地址，用户要能直接复制进浏览器。
+
+**后端**
+- `addLog` 不再做关键词丢弃，只分派到 `StartupTrace`（启动器输出 → `owned`，
+  dsh 输出 → `add`）。
+- 启动主流程改为阶段推进：`准备启动` → `等待工作台地址` → `服务已就绪`；
+  就绪即关闭当前阶段（否则阶段时长会随窗口挂着一直涨）。
+- `GET /api/instances/logs` 响应增补 `revision / stages / outcome / issueCount /
+  stage / elapsedMs`；`since` 改为 revision 游标（环形裁剪后行下标会错位）。
+- 修复耗时计算：未调用 `begin()` 时以首行时间为起点，不再出现
+  「耗时 1794584271.9s」这种距 1970 年的天文数字。
+- 修复时间戳时区：改用 `Instant + ZoneId.systemDefault()`，不再显示成 UTC 时刻。
+- 修复概览出现无名空阶段：`begin()` 直接以「准备启动」开场，并跳过
+  「完成『尚未启动』」这类无意义记录。
+- 多行拼接的提示拆成逐行（前端不再出现无时间戳裸文本）。
+- `scripts/build-tauri.sh` 改为编译 `src/com/dshlauncher/*.java`，
+  否则新增类不进 jar。
+
+**界面**
+- 日志区新增阶段概览（`#stageList`）：一行一阶段，名称 / 状态 / 耗时 / 占比条，
+  状态色 good / running / warn / bad / muted。
+- 修复首屏「等待启动…」永远清不掉：旧代码只删 `.log-empty`，而占位行用的是
+  `.log-line.muted`；现在统一用 `#logPlaceholder` 并在首条日志到来时移除。
+- 接上 CSS 里早有定义、HTML 里一直空着的 `.log-live` 状态灯与 `.log-count` 行数。
+- 时间戳弱化显示；阶段行左侧竖线加阶段色；切换实例时重置日志区。
+
+**验证**
+- 隔离 HOME + 一次性 profile 跑通 4 条路径：正常启动（3 阶段全 GOOD）、
+  停止（STOPPED）、失败（不存在的 profile → FAILED + 阶段 BAD + issueCount 3）、
+  外部实例冲突（IDLE + conflict，不再假装是阶段）。
+- `scripts/check-ui-states.sh` 全部通过；`scripts/check-layout.sh` 六个尺寸全部 PASS。
+
+## v2.19 — 2026-11-13 · 已有 dsh 时先接管，接管不了就拦住
+
+**需求**：移植 DSHA(Android) 的 Web 会话恢复思路 —— 启动器发现 dsh 已经在跑时，
+不再硬拒（旧行为：报「profile 已有一个 dsh 在运行」并要求用户 `kill`），而是
+先核验身份、再真实鉴权，能接回就接回；接不回就保留屏障，绝不悄悄起第二个。
+
+**关键事实（决定了能做到什么程度）**
+- dsh 的 launch token 是**进程内随机生成**（`processLaunchToken()` → `randomBytes`），
+  只在启动时打印一次 `dsh web: http://…/?token=…`，不落盘、不进 environ。
+- 因此：**本启动器自己拉起的实例**能接回（stdout 抓到过 authUrl）；
+  **终端里手起的实例**永远拿不到 token，只能识别 + 附着 + 由用户确认后接管重启。
+
+**后端**（`backend/src/com/dshlauncher/Backend.java`）
+- 新增会话记录 `~/.config/dsh-launcher/sessions/<id>.json`（0600），字段：
+  `pid / startTime(/proc/PID/stat 第22字段) / bootId / uid / cmdline / generation / port / authUrl / profile`。
+  只有 `recordRunningSession` 在**真正拿到鉴权地址后**才写，不写推测值。
+- `observe(Session)` → `LIVE / EXITED / UNKNOWN`：boot_id 变化、PID 消失、starttime 变化、
+  uid 变化都判 EXITED；**cmdline 读不到只判 UNKNOWN**，绝不把「读不到」当「已退出」。
+- `authenticate(authUrl)`：真实 HTTP GET，200/204/302/303 才算通过。
+- `adopt`：只改本地状态（`state=adopted`，`proc=null`），不启动、不停止、不重放业务。
+- 启动准入重写：有记录 → UNKNOWN 直接拦、LIVE+鉴权通过就接回、EXITED 才退休继续；
+  无记录但有同 profile 外部 dsh → `state=conflict`（不再硬拒），并附 PID / 真实端口。
+- `probeForeignPort(pid)`：`/proc/PID/fd` 的 `socket:[inode]` 与 `/proc/net/tcp{,6}`
+  的 LISTEN(0A) 行按 inode 匹配，同 uid 只读；读不到返回 -1，不猜。
+- 停止屏障：`adopted` 无 Process 句柄，按记录身份 `signalProcess` → 有界等待 → KILL，
+  只有 `observe == EXITED` 才清记录，否则转 `unknown` 保留屏障。
+- `signalProcess`：仅当 `pgrp == pid`（setsid 首领）才整组发信号，
+  否则只发给该 PID —— 外部 dsh 常与用户 shell 同组，整组会误伤。
+- 关闭启动器时，接回的实例也按身份带走（否则留孤儿）。
+- 新路由：`/api/instances/{session,recheck,forget,reclaim,attach,kill-foreign}`，
+  `/api/instances/health` 支持 `adopted`；`instanceJson` 增补
+  `sessionPid/sessionPort/unknownReason/foreignPid/foreignCmd/foreignPort/hasToken`。
+- 配置位置修正：旧版用 `DSH_HOME` 当 HOME，实例配置会写到 `$DSH_HOME/.config`，
+  从终端启动和从桌面启动会看到两份不同列表。现在配置固定跟随 `user.home`，
+  旧位置按 id + profile 合并一次（不覆盖、不产生同 profile 重复条目、留备份）。
+- 修复 `findForeignDsh` 漏检：`node /path/bin/dsh --profile web` 这种最常见的
+  命令行，旧判据只看第一个词 `node` 会漏掉，导致「以为没在跑」又起一个。
+  统一为 `looksLikeDshCmd`，覆盖 dsh / node / npx / bin.js 四种形态。
+
+**前端**（`gui/src/{app.js,index.html,style.css}`）
+- 新增 `adopted / conflict / unknown` 三态：标题、副标题、状态点、指标卡、地址提示全部区分。
+- hero 面板新增 `#sessionBar` 操作区：
+  - adopted → 「重新核验」「停止」
+  - conflict → 「附着打开」「接管重启」「仅结束外部实例」「重新检测」
+  - unknown → 「重新核验」「确认已退出并清理」「查看记录」
+- 「启动」按钮在 adopted 下变成「进入工作台」；在 conflict/unknown 下仍可点，
+  但后端准入会拦住并给出原因。
+- 「停止」在 conflict 下明确提示外部实例不归启动器管理，不假装成功。
+- 轮询把新增字段同步到本地状态，健康检查对 adopted 走身份核验而不是 Process 句柄。
+
+**新增检查**
+- `scripts/check-ui-states.sh`：DOM 结构、三态文案与按钮、后端路由、安全约束、样式类。
+  不用无头浏览器跑真实 `app.js` —— 它有常驻长轮询，在截图/取 DOM 的加载屏障下
+  会产生不确定的任务风暴，结果不可重复；行为正确性由后端 E2E 覆盖。
+
+**实测覆盖（隔离 HOME + 一次性 profile，跑完即清理）**
+1. 启动 → running，会话记录写入且含 token
+2. SIGKILL 后端（模拟宿主重建）→ dsh 存活 → 重启后 `adopted`，未重启、token 保留
+3. adopted 下点启动 → 进程数不变（不派生第二个）
+4. adopted 停止 → 按身份退出，记录退休，再启动正常
+5. 外部 dsh → `conflict` + 端口探测正确
+6. conflict 接管 → 结束外部、启动新实例、新 token 可鉴权（303）
+7. 假 token 的 UNKNOWN → 启动被拦、`forget` 被拒、`recheck` 返回 AUTH_FAILED
+8. 非进程组长 → 只发单 PID，未误伤同组 shell
+
+**未做 / 边界**
+- 外部实例的 token 无法恢复，这是 dsh 的设计（进程内随机、只打印一次）；
+  「附着打开」只给端口，需用户自己粘贴带 token 的完整地址。
+- `check_project` 插件本身报 `session.events is not iterable`，无法执行；
+  已用编译、`node --check`、`check-layout.sh`、`check-ui-states.sh` 与上述 E2E 替代。
+- 当前运行的启动器（PID 580821）仍是旧二进制，需重启启动器才会用上新代码。
+
+---
+
 ## v2.18 — 2026-11-13 · 布局铺满窗口 + 最小尺寸提级
 
 **需求**：界面要「挤满窗口」，不留大片空白。

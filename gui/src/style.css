@@ -74,6 +74,21 @@ h1 { font-size: 26px; font-weight: 600; margin-bottom: 0; letter-spacing: -.5px;
 .secondary-button { min-height: 72px; border: 1px solid var(--border-strong); border-radius: 19px; background: rgba(13,16,20,.36); font-size: 18px; font-weight: 600; transition: background .18s,border-color .18s; }
 .secondary-button:hover { background: var(--surface-hover); border-color: rgba(160,190,230,.5); }
 .button-symbol { color: #bac5d1; margin-right: 8px; font-size: 20px; }
+/* 会话接管区：adopted / conflict / unknown */
+.session-bar { margin-top: 14px; padding: 14px 16px; border: 1px solid var(--border-strong); border-radius: 16px; background: rgba(13,16,20,.28); display: flex; flex-direction: column; gap: 10px; }
+.session-bar[hidden] { display: none; }
+.session-bar.adopted { border-color: rgba(107,163,255,.45); }
+.session-bar.conflict { border-color: rgba(255,186,92,.45); }
+.session-bar.unknown { border-color: rgba(255,120,120,.45); }
+.session-note { margin: 0; font-size: 14px; line-height: 1.5; color: var(--muted); }
+.session-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.session-actions button { min-height: 44px; padding: 0 16px; border: 1px solid var(--border-strong); border-radius: 12px; background: rgba(13,16,20,.36); color: var(--text); font-size: 14px; font-weight: 600; cursor: pointer; transition: background .18s,border-color .18s; }
+.session-actions button:hover { background: var(--surface-hover); border-color: rgba(160,190,230,.5); }
+.session-actions button:disabled { opacity: .5; cursor: wait; }
+.session-actions button.danger { border-color: rgba(255,120,120,.5); color: #ffb3b3; }
+body.light .session-bar { background: #f8fafc; }
+body.light .session-actions button { background: #fff; color: #1b2733; }
+body.light .session-actions button.danger { color: #b42318; }
 .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .metric-card { min-height: 118px; padding: 22px 25px; display: flex; flex-direction: column; justify-content: center; gap: 11px; }
 .metric-value { font-size: 29px; line-height: 1; font-weight: 600; letter-spacing: -.6px; }
@@ -110,23 +125,74 @@ h1 { font-size: 26px; font-weight: 600; margin-bottom: 0; letter-spacing: -.5px;
 .logs-section { margin-top: 28px; }
 .logs-heading { margin-bottom: 15px; }
 .log-tools { display: flex; align-items: center; gap: 14px; }
-.log-live { display: inline-flex; align-items: center; gap: 7px; margin-left: 11px; font-size: 12px; font-weight: 500; letter-spacing: .2px; color: #6ed9a6; }
+.log-live { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 500; letter-spacing: .2px; color: #6ed9a6; }
 .log-live i { width: 7px; height: 7px; border-radius: 50%; background: #2ba471; box-shadow: 0 0 0 0 rgba(43,164,113,.5); animation: logPulse 1.8s ease-out infinite; }
 .log-live.paused { color: #efc36e; }
 .log-live.paused i { background: #d98a00; animation: none; box-shadow: none; }
 .log-live.offline { color: #8b95a3; }
 .log-live.offline i { background: #5b6472; animation: none; box-shadow: none; }
 @keyframes logPulse { 0% { box-shadow: 0 0 0 0 rgba(43,164,113,.45); } 70% { box-shadow: 0 0 0 7px rgba(43,164,113,0); } 100% { box-shadow: 0 0 0 0 rgba(43,164,113,0); } }
-.log-count { margin-left: 10px; font-size: 12px; font-weight: 500; color: #77828f; font-variant-numeric: tabular-nums; }
+.log-count { font-size: 12px; font-weight: 500; color: #77828f; font-variant-numeric: tabular-nums; }
+/* 日志工具栏：状态灯 + 行数 + 复制，靠右排成一组 */
+.logs-heading .log-tools { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.log-copy { margin-left: 4px; padding: 5px 11px; border-radius: 8px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.04); color: #aebacb; font: inherit; font-size: 12px; line-height: 1.4; cursor: pointer; transition: background .16s ease, border-color .16s ease, color .16s ease; }
+.log-copy:hover { background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.2); color: #e6eef8; }
+.log-copy:active { background: rgba(255,255,255,.13); }
+.log-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+body.light .log-copy { border-color: rgba(70,86,105,.22); background: rgba(70,86,105,.05); color: #4a5766; }
+body.light .log-copy:hover { background: rgba(70,86,105,.11); border-color: rgba(70,86,105,.32); color: #1f2a36; }
 body.light .log-count { color: #6a7686; }
 body.light .log-live { color: #1f8b58; }
 body.light .log-live.offline { color: #7b8794; }
 .log-window { min-height: 220px; max-height: 310px; overflow: auto; padding: 20px 21px; border-radius: 17px; background: linear-gradient(145deg,#10151c,#11161d); color: #d1d9e2; font: 13px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace; border: 1px solid rgba(255,255,255,.035); }
+/* 阶段概览：一行一阶段，名称 + 状态 + 耗时 + 占比条 */
+.stage-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; padding: 10px 14px; border-radius: 15px; background: rgba(255,255,255,.022); border: 1px solid rgba(255,255,255,.05); }
+/* display:flex 会盖掉 hidden 的默认 display:none，必须显式兜住，否则没阶段时会留一条空框 */
+.stage-list[hidden] { display: none; }
+.stage-row { display: grid; grid-template-columns: minmax(0,1fr) auto auto 92px; align-items: center; gap: 11px; padding: 6px 2px; font-size: 12.5px; }
+.stage-row + .stage-row { border-top: 1px solid rgba(255,255,255,.045); }
+.stage-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #dbe4ef; font-weight: 500; }
+.stage-state { font-size: 11.5px; font-weight: 600; letter-spacing: .2px; color: #8fa0b4; white-space: nowrap; }
+.stage-dur { font-size: 11.5px; color: #77828f; font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+.stage-bar { height: 3px; border-radius: 3px; background: rgba(255,255,255,.07); overflow: hidden; }
+.stage-bar i { display: block; height: 100%; border-radius: 3px; background: #3d7ee8; }
+.stage-row.good .stage-state { color: #6ed9a6; }
+.stage-row.good .stage-bar i { background: #2ba471; }
+.stage-row.running .stage-state { color: #6da8f5; }
+.stage-row.running .stage-bar i { background: #3d7ee8; }
+.stage-row.warn .stage-state { color: #efc36e; }
+.stage-row.warn .stage-bar i { background: #d98a00; }
+.stage-row.bad .stage-state { color: #f2949c; }
+.stage-row.bad .stage-bar i { background: #e05a66; }
+.stage-row.muted .stage-name { color: #8b95a3; }
+.stage-row.muted .stage-bar i { background: #5b6472; }
+body.light .stage-list { background: rgba(70,86,105,.05); border-color: rgba(70,86,105,.12); }
+body.light .stage-row + .stage-row { border-top-color: rgba(70,86,105,.12); }
+body.light .stage-name { color: #263445; }
+body.light .stage-dur { color: #6a7686; }
+body.light .stage-row.muted .stage-name { color: #7b8794; }
 .log-line { white-space: pre-wrap; overflow-wrap: anywhere; }
 /* 日志统一用一种颜色（用户要求）：分类类名保留在 DOM 上，
-   但不再分类着色，深浅主题各给一个统一色。 */
+   但不再分类着色，深浅主题各给一个统一色。
+   注意顺序：这条要放在阶段行规则之前，否则同权重会把阶段色盖掉。 */
 .log-line, .log-line.info, .log-line.success, .log-line.warn,
 .log-line.error, .log-line.muted, .log-line.time { color: #d1d9e2; }
+/* 时间戳弱化，正文才是重点；等宽数字避免每行时间戳跳动 */
+.log-ts { color: #5d6a7a; font-variant-numeric: tabular-nums; }
+body.light .log-ts { color: #94a1b2; }
+/* 阶段行：后端以 ▸ 开头的锚点，加一条左侧竖线，扫一眼就知道走到哪一步 */
+.log-line.stage { position: relative; padding-left: 12px; margin: 6px 0 3px; color: #a9bdd6; }
+.log-line.stage::before { content: ""; position: absolute; left: 0; top: .45em; bottom: .45em; width: 2px; border-radius: 2px; background: rgba(84, 148, 240, .55); }
+.log-line.stage.ok { color: #8ee0b4; }
+.log-line.stage.ok::before { background: #2ba471; }
+.log-line.stage.err { color: #f2949c; }
+.log-line.stage.err::before { background: #e05a66; }
+body.light .log-line.stage { color: #3d5d85; }
+body.light .log-line.stage.ok { color: #1f8b58; }
+body.light .log-line.stage.err { color: #c2404c; }
+/* 日志被清空 / 未启动时的占位提示 */
+.log-empty, #logPlaceholder { display: flex; gap: 8px; align-items: center; color: #7b8794; }
+body.light .log-empty, body.light #logPlaceholder { color: #8490a0; }
 .bottom-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .bottom-actions .secondary-button { min-height: 66px; font-size: 15px; }
 .tabs-panel { margin-top: 24px; padding: 0 22px 18px; }
@@ -376,7 +442,11 @@ body.light #pluginView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,1
    —— 由 DSHA-Plugin-UI 的横屏布局改造而来，改用控制中心自身的
       设计变量，去掉移动端底部导航与超大字号，适配桌面窗口。
    ===================================================================== */
-.view[hidden] { display: none; }
+/* hidden 必须能压住各视图自己的 display。
+   #consoleView 在桌面断点里是 display:flex（ID 选择器优先级 1,0,0），
+   而 .view[hidden] 只有 0,2,0 —— 不加 !important 的话 hidden 会失效，
+   切到「插件」「设置」时控制台仍然留在屏幕上，两层内容叠在一起。 */
+.view[hidden] { display: none !important; }
 
 /* 插件页内容会比控制台长，必须自己能滚。
    桌面断点下 html/body 与 .main-content 都是 overflow:hidden，
@@ -388,6 +458,10 @@ body.light #pluginView::-webkit-scrollbar-thumb:hover { background: rgba(70,86,1
   overflow-x: hidden;
   /* 留出滚动条位置，避免出现/消失时内容横向跳动 */
   scrollbar-gutter: stable;
+  /* 标准属性：WebKit 的 ::-webkit-scrollbar 管不到 Firefox / 部分 WebView，
+     不写这两行会在深色界面上留一条纯白滚动条。 */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,.16) transparent;
   /* 底部留白，最后一张卡片不贴着窗口边 */
   padding-bottom: 8px;
 }
@@ -425,6 +499,8 @@ body.modal-open { overflow: hidden; }
   overflow-y: auto;
   overflow-x: hidden;
   scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,.16) transparent;
   padding-bottom: 8px;
 }
 #settingsView::-webkit-scrollbar { width: 10px; }

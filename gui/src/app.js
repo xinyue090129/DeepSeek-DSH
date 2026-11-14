@@ -7,6 +7,8 @@
   // 后端端口由 Tauri 在启动时选定（7080 起，被占用则顺延），
   // 通过 IPC 取真实值，不能写死。
   let API = "http://127.0.0.1:7080";
+  /** 从 /api/health 响应头抓取的一次性启动令牌，后续请求携带 X-DSH-Token。 */
+  let API_TOKEN = null;
   const $ = (id) => document.getElementById(id);
 
   // 启动器偏好：默认手动启动 —— 打开启动器不会自作主张拉起 dsh
@@ -21,7 +23,14 @@
     localStorage.setItem("dsha.prefMigrated", "v26");
   }
   let AUTO_START = pref("dsha.autoStart", false);
-  let AUTO_OPEN = pref("dsha.autoOpen", true);
+  // 就绪后自动进入工作台：默认关闭（妈妈要求启动后不要自动弹工作台），
+  // 需要的话在「设置 → 基础设置」里手动打开。
+  // v27 迁移：清掉旧默认（曾为开启）留下的本地值，让新默认立即生效。
+  if (localStorage.getItem("dsha.prefMigrated") !== "v27") {
+    localStorage.removeItem("dsha.autoOpen");
+    localStorage.setItem("dsha.prefMigrated", "v27");
+  }
+  let AUTO_OPEN = pref("dsha.autoOpen", false);
 
   async function resolveApi() {
     try {
@@ -50,6 +59,223 @@
     return api("/api/open", { url });
   }
 
+  // =====================================================================
+  //  DSHA 风格启动观察器：全局异常捕获 + 启动诊断
+  //  参考 DSHA-App/DSHA 的 startup.js：
+  //  - 防重复执行（nonce + documentId）
+  //  - window.error / unhandledrejection 上报
+  //  - 模块加载器包装（捕获插件初始化失败）
+  //  - MutationObserver 监控页面就绪
+  //  - 所有上报带 token 鉴权，走 /api/frontend-error
+  // =====================================================================
+  (function installStartupObserver() {
+    'use strict';
+    if (window.__dshaStartupObserved) return;
+    window.__dshaStartupObserved = true;
+
+    const binding = window.__DSHA_PAGE_BINDING__ || {};
+    const observationNonce = String(binding.nonce || '');
+    const documentId = String(Date.now()) + '-' + Math.random().toString(36).slice(2);
+    window.__dshaStartupDocumentId = documentId;
+
+    let ready = false, count = 0;
+    // 启动就绪检测用到的状态（先前漏声明，严格模式下会抛 ReferenceError 导致整段脚本中断）
+    let seenBoot = false, lastFailure = '';
+    const MAX_REPORTS = 500;
+    const reportedActive = Object.create(null);
+    const reportedLoading = Object.create(null);
+
+    function uiText(zh, en) {
+      return (window.__DSHA_LANGUAGE__ === 'en') ? en : zh;
+    }
+
+    function report(type, id, message, fatal) {
+      if (count++ > MAX_REPORTS) return;
+      const payload = {
+        type: type,
+        id: String(id || '').slice(0, 214),
+        message: String(message || '').slice(0, 6000),
+        fatal: !!fatal && !ready,
+        nonce: observationNonce,
+        documentId: documentId,
+        sequence: count - 1,
+        page: location.origin + location.pathname
+      };
+      console.info('[DSHA_PAGE] ' + JSON.stringify(payload));
+      // 发送到后端 /api/frontend-error（带鉴权头，api() 会自动处理）
+      fetch(API + '/api/frontend-error', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).catch(() => { /* 上报失败不抛错，避免循环 */ });
+    }
+
+    function reportPlugin(type, id, message, fatal) {
+      const key = String(id || '');
+      if (type === 'loading') {
+        if (reportedActive[key] || reportedLoading[key]) return;
+        reportedLoading[key] = true;
+      } else if (type === 'active') {
+        reportedLoading[key] = false;
+        if (reportedActive[key]) return;
+        reportedActive[key] = true;
+      } else if (type === 'issue') {
+        reportedLoading[key] = false;
+        reportedActive[key] = false;
+      }
+      report(type, key, message, fatal);
+    }
+
+    function detail(error) {
+      return error && (error.stack || error.message) || String(error);
+    }
+
+    // 包装模块加载器的 factory，捕获插件初始化错误
+    function wrapExports(value, id) {
+      if (!value || typeof value.apply !== 'function') return value;
+      const descriptor = Object.getOwnPropertyDescriptor(value, 'apply');
+      if (!descriptor || !descriptor.writable) return value;
+      const original = value.apply;
+      value.apply = function () {
+        reportPlugin('loading', id, uiText('正在初始化网页插件：', 'Initializing web plugin: ') + id);
+        try {
+          const result = original.apply(this, arguments);
+          if (result && typeof result.then === 'function') {
+            return result.then(
+              (v) => { reportPlugin('active', id, uiText('网页插件初始化返回：', 'Web plugin initialization returned: ') + id); return v; },
+              (error) => { reportPlugin('issue', id, detail(error)); throw error; }
+            );
+          }
+          reportPlugin('active', id, uiText('网页插件初始化返回：', 'Web plugin initialization returned: ') + id);
+          return result;
+        } catch (error) {
+          reportPlugin('issue', id, detail(error));
+          throw error;
+        }
+      };
+      return value;
+    }
+
+    function wrap(loader) {
+      if (!loader || loader.__dshaObserved || typeof loader.load !== 'function') return loader;
+      try {
+        const original = loader.load;
+        loader.load = function (definition) {
+          if (!definition || typeof definition.factory !== 'function') return original.apply(this, arguments);
+          const args = Array.prototype.slice.call(arguments);
+          const factory = definition.factory;
+          const id = definition.id;
+          args[0] = Object.assign({}, definition, {
+            factory: function () {
+              try { return wrapExports(factory.apply(this, arguments), id); }
+              catch (error) { report('issue', id, detail(error)); throw error; }
+            }
+          });
+          return original.apply(this, args);
+        };
+        Object.defineProperty(loader, '__dshaObserved', { value: true });
+      } catch (_) { /* 观察不可用时保持原加载行为 */ }
+      return loader;
+    }
+
+    // 挂载到 window.__ModuleLoader__（如果有的话）
+    try {
+      const desc = Object.getOwnPropertyDescriptor(window, '__ModuleLoader__');
+      if (!desc) {
+        let facade;
+        Object.defineProperty(window, '__ModuleLoader__', {
+          configurable: true, enumerable: true,
+          get: function () { return facade; },
+          set: function (v) { facade = wrap(v); }
+        });
+      } else {
+        wrap(window.__ModuleLoader__);
+      }
+    } catch (_) {}
+
+    // 全局 JS 错误捕获
+    window.addEventListener('error', function (event) {
+      if (event.error || event.message) {
+        report('issue', '', detail(event.error || event.message) + '\n' + (event.filename || ''));
+      }
+    });
+    window.addEventListener('unhandledrejection', function (event) {
+      report('issue', '', detail(event.reason));
+    });
+
+    // 页面就绪检测
+    function inspect() {
+      if (ready) return;
+      wrap(window.__ModuleLoader__);
+      const boot = document.querySelector('[data-dsh-boot]');
+      if (boot) {
+        seenBoot = true;
+        const text = boot.textContent || '';
+        if (/Failed to load plugins|did not activate/.test(text) && text !== lastFailure) {
+          lastFailure = text;
+          report('issue', '', text, true);
+        }
+      }
+      const root = document.getElementById('root');
+      const mountedShell = root && root.querySelector('[data-shell-overlay]') && root.querySelector('[data-shell-bottom]');
+      if (!boot && (document.querySelector('[data-composer-input]') || mountedShell || (seenBoot && root && root.children.length))) {
+        ready = true;
+        report('ready', '', uiText('网页已就绪', 'Web page ready'));
+        observer.disconnect();
+      }
+    }
+
+    const observer = new MutationObserver(inspect);
+    observer.observe(document, { childList: true, subtree: true, characterData: true });
+    inspect();
+  })();
+
+  /**
+   * 带鉴权头的 fetch。首次请求 /api/health 时不带 token（服务器会在响应头
+   * 里回写 X-DSH-Token），后续请求统一带上。
+   */
+  async function api(path, body) {
+    // 令牌懒加载：还没拿到 token 时，先向免鉴权的 /api/health 要一次，
+    // 否则第一次 /api/instances 就会 401，界面会一直连不上后端。
+    if (!API_TOKEN && path !== "/api/health") {
+      try {
+        const hres = await fetch(API + "/api/health");
+        const tok = hres.headers.get("x-dsh-token");
+        if (tok) API_TOKEN = tok;
+      } catch (_) { /* 后端未起，交给下面的请求报错 */ }
+    }
+    const opt = body === undefined
+      ? { method: "GET" }
+      : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+    if (API_TOKEN) opt.headers = Object.assign({}, opt.headers, { "X-DSH-Token": API_TOKEN });
+    const res = await fetch(API + path, opt);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    // 首次访问 /api/health 时，从响应头抓取启动令牌
+    if (path === "/api/health" && !API_TOKEN) {
+      const tok = res.headers.get("x-dsh-token");
+      if (tok) API_TOKEN = tok;
+    }
+    return res.json();
+  }
+
+  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  // ---------------------------------------------------------------- 工具
+  /** 轻提示：type = ok | err | info（对应不同描边色）。 */
+  let toastTimer;
+  function toast(msg, type) {
+    const el = $("toast");
+    if (!el) return;
+    el.textContent = msg;
+    el.className = "toast show" + (type ? " " + type : "");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      el.className = "toast" + (type ? " " + type : "");
+    }, 2800);
+  }
+
+  // ---------------------------------------------------------------- 全局状态
   const st = {
     instance: null,
     instances: [],
@@ -58,34 +284,21 @@
     backendUp: false,
     busy: false,
     autoScroll: true,
-    localOffset: 0,   // 已渲染的绝对行号（含被后端裁掉的部分）
+    localOffset: 0,
     ready: false
   };
 
-  // ---------------------------------------------------------------- 工具
-  let toastTimer;
-  function toast(msg) {
-    const el = $("toast");
-    el.textContent = msg;
-    el.classList.add("show");
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => el.classList.remove("show"), 2800);
-  }
-
-  async function api(path, body) {
-    const opt = body === undefined
-      ? { method: "GET" }
-      : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
-    const res = await fetch(API + path, opt);
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    return res.json();
-  }
-
-  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-
   // ---------------------------------------------------------------- 日志
+  // 阶段行（后端「正在 X…」/「完成「X」，耗时 Y」/「切换离开」）单独标出来，
+  // 不解析具体文案含义，只认这三种固定句式——和后端 StartupTrace 的 kind 一一对应。
+  const STAGE = /^\[[^\]]*\]\s*(?:正在.+…|完成「.+」，耗时|切换离开「.+」，停留)/;
+
   function logClass(line) {
+    if (STAGE.test(line)) {
+      if (/超时|失败|异常/.test(line)) return "stage err";
+      if (/^\[[^\]]*\]\s*完成「/.test(line)) return "stage ok";
+      return "stage";
+    }
     if (/error|失败|异常|超时|exit code = [1-9]/i.test(line)) return "error";
     if (/占用|警告|停止|重启|ExperimentalWarning/i.test(line)) return "warn";
     if (/就绪|已启动|listening|running|token=/i.test(line)) return "success";
@@ -93,17 +306,37 @@
     return "info";
   }
 
-  // 日志里出现的 token 打码，避免明文暴露在屏幕上
-  const maskToken = (s) => String(s).replace(/(token=)[A-Za-z0-9_\-]{6,}/g, "$1••••••••");
+  // 工作台 token 不再打码：它只在 127.0.0.1 上有效，用户需要能直接复制到浏览器
+  const maskToken = (s) => String(s);
+
+  /** 清空占位提示；有真日志就不再显示「等待启动…」。 */
+  function clearPlaceholder(box) {
+    const ph = box.querySelector("#logPlaceholder, .log-empty");
+    if (ph) ph.remove();
+  }
 
   function appendLogs(lines) {
     if (!lines || !lines.length) return;
     const box = $("logWindow");
+    clearPlaceholder(box);
     const frag = document.createDocumentFragment();
     for (const raw of lines) {
       const d = document.createElement("div");
       d.className = "log-line " + logClass(raw);
-      d.textContent = maskToken(raw);
+      const masked = maskToken(raw);
+      // 时间槽单独弱化：支持两种口径
+      //   [0.0s]                        自启动开始的相对耗时
+      //   [运行 +12.3s / 自启动记录 1.2s] 就绪后的双口径
+      const m = masked.match(/^\[(?:运行 \+[^\]]*|[\d.]+\s*m?s)\]\s*/);
+      if (m) {
+        const ts = document.createElement("span");
+        ts.className = "log-ts";
+        ts.textContent = m[0];
+        d.appendChild(ts);
+        d.appendChild(document.createTextNode(masked.slice(m[0].length)));
+      } else {
+        d.textContent = masked;
+      }
       frag.appendChild(d);
     }
     box.appendChild(frag);
@@ -111,19 +344,176 @@
     if (st.autoScroll) box.scrollTop = box.scrollHeight;
   }
 
+  /**
+   * 复制完整日志。
+   *
+   * 与 DSHA 的 `copyLogs()` 对齐，三条硬要求：
+   *   1. 复制的是<b>完整原文</b>，与屏幕上可能有的滚动裁剪无关；
+   *   2. 日志为空时明确提示「还没有可复制的日志」，不静默失败；
+   *   3. 写剪贴板失败必须有回退，不能什么都不发生（旧版就是这个 bug）。
+   */
+  async function copyLogs() {
+    const box = $("logWindow");
+    if (!box) return;
+    const placeholder = box.querySelector("#logPlaceholder");
+    const lines = Array.from(box.querySelectorAll(".log-line"))
+      .filter((el) => el !== placeholder)
+      .map((el) => el.textContent);
+    if (!lines.length) {
+      toast("还没有可复制的日志", "info");
+      return;
+    }
+    const text = lines.join("\n");
+    const ok = await writeClipboard(text);
+    if (ok) toast(`已复制 ${lines.length} 行日志`, "ok");
+    else toast("复制失败：剪贴板不可用", "err");
+  }
+
+  /**
+   * 写剪贴板，两条路：异步 Clipboard API 优先；被拒（无用户手势 / 非安全上下文）
+   * 就退回隐藏 textarea + execCommand，这在 WebView 里更可靠。
+   */
+  async function writeClipboard(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) { /* 落到下面的回退 */ }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      const done = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return done;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * 阶段概览：把后端按阶段折叠好的结果画成一行一阶段。
+   *
+   * 对应 DSHA 的 StartupLogDigest：名称 / 状态 / 耗时 / 占比条。
+   * 后端已经按 Entry.kind 分好组，这里不解析中文文案。
+   */
+  const STAGE_STATE = {
+    RUNNING: ["进行中", "running"],
+    GOOD: ["完成", "good"],
+    WARN: ["有提示", "warn"],
+    BAD: ["失败", "bad"],
+    MUTED: ["未开始", "muted"],
+  };
+
+  function fmtDuration(ms) {
+    if (typeof ms !== "number" || ms < 0) return "";
+    if (ms < 1000) return ms + "ms";
+    if (ms < 60000) return (ms / 1000).toFixed(1) + "s";
+    return Math.floor(ms / 60000) + "m" + Math.round((ms % 60000) / 1000) + "s";
+  }
+
+  function renderStages(stages) {
+    const box = $("stageList");
+    if (!box) return;
+    if (!Array.isArray(stages) || !stages.length) {
+      box.hidden = true;
+      box.replaceChildren();
+      return;
+    }
+    box.hidden = false;
+    const total = Math.max(
+      1,
+      stages.reduce((sum, s) => sum + Math.max(0, s.durationMs || 0), 0)
+    );
+    const frag = document.createDocumentFragment();
+    for (const s of stages) {
+      const [label, tone] = STAGE_STATE[s.state] || ["—", "muted"];
+      const row = document.createElement("div");
+      row.className = "stage-row " + tone;
+
+      const name = document.createElement("span");
+      name.className = "stage-name";
+      name.textContent = s.name || "准备";
+
+      const state = document.createElement("span");
+      state.className = "stage-state";
+      state.textContent = label;
+
+      const dur = document.createElement("span");
+      dur.className = "stage-dur";
+      dur.textContent = fmtDuration(s.durationMs);
+
+      const bar = document.createElement("span");
+      bar.className = "stage-bar";
+      const fill = document.createElement("i");
+      fill.style.width =
+        typeof s.durationMs === "number" && s.durationMs >= 0
+          ? Math.min(100, Math.max(1, (s.durationMs / total) * 100)) + "%"
+          : "0%";
+      bar.appendChild(fill);
+
+      row.append(name, state, dur, bar);
+      frag.appendChild(row);
+    }
+    box.replaceChildren(frag);
+  }
+
+  /**
+   * 日志流状态灯：连接中 / 实时 / 断开。
+   * 只反映「日志通道」是否在工作，不代替实例状态。
+   */
+  function setLogLive(mode, text) {
+    const live = $("logLive");
+    const label = $("logLiveText");
+    if (!live) return;
+    live.className = "log-live " + mode;
+    if (label) label.textContent = text;
+  }
+
+  /** 实例切走或日志流断开时，把日志区恢复成可理解的初始态。 */
+  function resetLogWindow(message) {
+    const box = $("logWindow");
+    if (!box) return;
+    box.replaceChildren();
+    const ph = document.createElement("div");
+    ph.className = "log-line muted";
+    ph.id = "logPlaceholder";
+    ph.textContent = message || "等待启动…";
+    box.appendChild(ph);
+    const stages = $("stageList");
+    if (stages) {
+      stages.hidden = true;
+      stages.replaceChildren();
+    }
+    setLogLive("offline", "未连接");
+    const counter = $("logCount");
+    if (counter) counter.textContent = "";
+  }
+
   // ---------------------------------------------------------------- 渲染
-  const LABEL = { stopped: "未运行", starting: "启动中", running: "运行中", error: "异常" };
+  const LABEL = { stopped: "未运行", starting: "启动中", running: "运行中", adopted: "已接回", conflict: "实例冲突", unknown: "待核验", error: "异常" };
   const HEAD = {
     stopped: ["DSH 未运行", "随时开始你的下一项任务。"],
     starting: ["DSH 正在启动", "正在准备运行环境，请稍候。"],
     running: ["DSH 正在运行", "运行环境已就绪，可以开始使用。"],
+    adopted: ["DSH 已在运行", "这是启动器之前拉起的实例，已按身份核验接回，没有重启。"],
+    conflict: ["已有外部 dsh 在运行", "它不是启动器拉起的，token 无法取得，需要你选择处理方式。"],
+    unknown: ["运行状态待核验", "进程身份或鉴权未确认，已保留屏障，不会自动重启。"],
     error: ["DSH 运行异常", "启动过程中遇到问题，请检查日志。"]
   };
 
   function setDots(s) {
+    const cls = ["running", "starting", "error", "stopped", "adopted", "conflict", "unknown"];
     document.querySelectorAll(".status-dot").forEach((d) => {
-      d.classList.remove("running", "starting", "error", "stopped");
-      d.classList.add(s);
+      d.classList.remove(...cls);
+      d.classList.add(s === "adopted" ? "running" : s === "conflict" || s === "unknown" ? "starting" : s);
     });
   }
 
@@ -135,14 +525,21 @@
     setDots(s);
     const foreign = st.foreignDsh || [];
     $("headerStatus").textContent = !st.backendUp ? "后端未连接"
+      : s === "adopted" ? "已接回原实例"
+      : s === "conflict" ? "外部实例冲突"
+      : s === "unknown" ? "待核验"
       : foreign.length ? `已有外部 dsh (PID ${foreign[0].pid})`
       : LABEL[s];
     $("instanceTitle").textContent = title;
-    $("instanceSubtitle").textContent = foreign.length
-      ? `系统里已有 dsh 在运行（PID ${foreign[0].pid}），需先结束它才能启动。全局只允许一个 dsh。`
+    $("instanceSubtitle").textContent = s === "conflict" && it && it.foreignPid
+      ? `PID ${it.foreignPid}${it.foreignPort > 0 ? " · 端口 " + it.foreignPort : ""} · profile ${it.profile}`
+      : s === "unknown" && it
+      ? `${it.name} · profile ${it.profile} · 原因 ${it.unknownReason || "IDENTITY_UNKNOWN"}`
       : it ? `${it.name} · profile ${it.profile}` : "等待本地后端连接…";
 
-    const running = s === "running";
+    renderSessionBar(it, s);
+
+    const running = s === "running" || s === "adopted";
     const port = it && it.actualPort > 0 ? it.actualPort : null;
 
     // ONLINE 标题旁显示真实端口
@@ -151,15 +548,18 @@
     webEl.classList.toggle("online", !!online);
     webEl.textContent = online
       ? `ONLINE :${port}`
-      : s === "starting" ? "STARTING" : s === "error" ? "ERROR" : "READY";
+      : s === "starting" ? "STARTING" : s === "error" ? "ERROR" : s === "unknown" ? "UNKNOWN" : "READY";
 
     $("portValue").textContent = port && (running || s === "starting") ? port : "—";
-    $("runtimeValue").textContent = running ? "ACTIVE" : s === "starting" ? "BOOTING" : s === "error" ? "ERROR" : "READY";
+    $("runtimeValue").textContent = running ? "ACTIVE" : s === "starting" ? "BOOTING"
+      : s === "unknown" ? "UNKNOWN" : s === "conflict" ? "CONFLICT" : s === "error" ? "ERROR" : "READY";
 
     const hint = $("addressHint");
     if (hint) {
       hint.textContent = running && port
         ? `http://127.0.0.1:${port} · 点击进入工作台`
+        : s === "conflict"
+        ? "外部实例：可附着打开（需自备 token）或接管重启"
         : (it ? `端口 ${it.autoPort ? "自动分配" : it.port} · 启动后可访问` : "启动后可直接进入工作台");
     }
 
@@ -171,6 +571,9 @@
     } else if (s === "starting") {
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span><span>正在启动…</span>';
+    } else if (s === "conflict" || s === "unknown") {
+      btn.disabled = st.busy || !st.backendUp;
+      btn.innerHTML = '<span class="play-icon">▶</span><span>启动 DSHA</span>';
     } else {
       btn.disabled = st.busy || !st.backendUp;
       btn.innerHTML = '<span class="play-icon">▶</span><span>启动 DSHA</span>';
@@ -185,6 +588,109 @@
     // 日志行数放在标题右侧，长跑时也能看出流有没有在动
     const counter = $("logCount");
     if (counter) counter.textContent = st.localOffset ? `${st.localOffset} 行` : "";
+    // 日志通道状态：有实例在跑就是实时，否则断开
+    if (!st.backendUp) setLogLive("offline", "后端未连接");
+    else if (running) setLogLive("", "实时");
+    else if (s === "starting") setLogLive("", "启动中");
+    else setLogLive("offline", "未运行");
+  }
+
+  /**
+   * 会话接管操作区：只在这三种状态下出现。
+   * adopted → 无需启动，可停止或重启；conflict → 附着/接管/诊断；unknown → 核验/确认退出。
+   */
+  function renderSessionBar(it, s) {
+    const bar = $("sessionBar");
+    if (!bar) return;
+    const note = $("sessionNote");
+    const actions = $("sessionActions");
+    bar.className = "session-bar " + s;
+    actions.replaceChildren();
+
+    const add = (label, cls, fn) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+      if (cls) b.className = cls;
+      b.disabled = st.busy;
+      b.addEventListener("click", () => act(fn));
+      actions.appendChild(b);
+    };
+
+    if (s === "adopted") {
+      bar.hidden = false;
+      note.textContent = `已按内核身份接回原实例（PID ${it.sessionPid || "?"}，端口 ${it.sessionPort || it.actualPort}）。重启不会重放旧任务。`;
+      add("重新核验", "", () => recheckInstance(it.id));
+      add("停止", "danger", () => stopInstance(it.id));
+    } else if (s === "conflict") {
+      bar.hidden = false;
+      note.textContent = "这个 dsh 由终端或其它程序启动，launch token 只在它启动时打印过一次，启动器无法取得，所以不能自动接回。";
+      add("附着打开", "", () => attachInstance(it.id));
+      add("接管重启", "danger", () => reclaimInstance(it.id));
+      add("仅结束外部实例", "danger", () => killForeign(it.id));
+      add("重新检测", "", async () => { await refresh(); });
+    } else if (s === "unknown") {
+      bar.hidden = false;
+      note.textContent = "身份或鉴权未确认。为避免出现第二个实例，自动启动已被拦住；请先核验，确认已退出后再启动。";
+      add("重新核验", "", () => recheckInstance(it.id));
+      add("确认已退出并清理", "danger", () => forgetInstance(it.id));
+      add("查看记录", "", () => showSession(it.id));
+    } else {
+      bar.hidden = true;
+    }
+  }
+
+  async function recheckInstance(id) {
+    const r = await api("/api/instances/recheck", { id });
+    toast(r.result === "RESTORED" ? "已接回原实例" : r.result === "EXITED" ? "原实例已确认退出" :
+      r.result === "AUTH_FAILED" ? "进程在，但鉴权未通过" : r.result === "UNKNOWN" ? "身份仍未确认" : "没有会话记录",
+      r.result === "RESTORED" || r.result === "EXITED" ? "ok" : "info");
+    await refresh();
+  }
+
+  async function forgetInstance(id) {
+    const r = await api("/api/instances/forget", { id });
+    if (!r.ok) return toast(r.error || "清理失败", "err");
+    toast("记录已退休，可以重新启动", "ok");
+    await refresh();
+  }
+
+  async function attachInstance(id) {
+    const r = await api("/api/instances/attach", { id });
+    if (!r.ok) return toast(r.error || "无法附着", "err");
+    toast(`已在浏览器打开 :${r.port}（token 需自行粘贴）`, "info");
+    await refresh();
+  }
+
+  async function reclaimInstance(id) {
+    const r = await api("/api/instances/reclaim", { id });
+    if (!r.ok) return toast(r.error || "接管失败", "err");
+    toast("外部实例已结束，正在启动新实例…", "info");
+    await poll();
+  }
+
+  async function killForeign(id) {
+    const r = await api("/api/instances/kill-foreign", { id });
+    if (!r.ok) return toast(r.error || "结束失败", "err");
+    toast("外部 dsh 已结束", "ok");
+    await refresh();
+  }
+
+  async function stopInstance(id) {
+    stopWatch();
+    await api("/api/instances/stop", { id });
+    toast("正在停止…", "info");
+    const done = await waitForState(id, ["stopped", "error", "unknown"], 15000);
+    await poll();
+    if (done === "stopped") toast("已停止", "ok");
+    else if (done === "unknown") toast("停止未确认，已保留屏障", "err");
+  }
+
+  async function showSession(id) {
+    const r = await api("/api/instances/session", { id });
+    if (!r.ok || !r.session) return toast("没有会话记录", "info");
+    const s = r.session;
+    toast(`PID ${s.pid} · ${s.observation} · 端口 ${s.port} · 有 token：${s.hasToken ? "是" : "否"}`, "info");
   }
 
   // ---------------------------------------------------------------- 轮询
@@ -217,12 +723,15 @@
     if (lines.length) {
       appendLogs(lines);
     }
+    // 阶段概览跟着日志一起刷：后端每次返回已折叠好的 stages
+    if (Array.isArray(r.stages)) renderStages(r.stages);
     // since 是对「后端当前缓冲」的游标，total 可能因环形裁剪而回落
-    st.since = typeof r.total === "number" ? r.total : st.since;
-    st.localOffset = (typeof r.dropped === "number" ? r.dropped : 0) + st.since;
+    st.since = typeof r.revision === "number" ? r.revision : st.since;
+    st.localOffset = (typeof r.dropped === "number" ? r.dropped : 0) + (r.total || 0);
     applyState(r);
     const counter = $("logCount");
     if (counter) counter.textContent = st.localOffset ? `${st.localOffset} 行` : "";
+    setLogLive("", "实时");
   }
 
   /** 常驻的日志循环：空闲时长轮询保状态新鲜，有日志时立刻刷。 */
@@ -237,6 +746,7 @@
         await pullLogs(true);
         backoff = 400;
       } catch (_) {
+        setLogLive("offline", "日志流中断，重试中");
         await sleep(backoff);
         backoff = Math.min(backoff * 2, 5000);
       }
@@ -250,9 +760,33 @@
       const list = await api("/api/instances");
       const cur = (list || []).find((i) => i.id === st.instance.id);
       if (cur) {
+        // 健康检查：dsh 崩溃了自动尝试重启
+        if (cur.state === "error" && (st.instance.state === "running" || st.instance.state === "adopted")) {
+          st.instance.state = "starting";
+          st.instance.actualPort = -1;
+          st.instance.workbenchUrl = "";
+          render();
+          try {
+            await api("/api/instances/start", { id: st.instance.id });
+            const nxt = (await api("/api/instances")).find((i) => i.id === st.instance.id);
+            if (nxt) st.instance = nxt;
+            render();
+            toast("dsh 已崩溃，正在自动重启", "info");
+          } catch (e) {
+            toast("dsh 自动重启失败：" + e.message, "err");
+          }
+          return;
+        }
         st.instance.state = cur.state;
         st.instance.actualPort = cur.actualPort;
         st.instance.url = cur.url;
+        st.instance.sessionPid = cur.sessionPid;
+        st.instance.sessionPort = cur.sessionPort;
+        st.instance.unknownReason = cur.unknownReason;
+        st.instance.foreignPid = cur.foreignPid;
+        st.instance.foreignCmd = cur.foreignCmd;
+        st.instance.foreignPort = cur.foreignPort;
+        st.instance.hasToken = cur.hasToken;
         render();
       }
     } catch (_) { /* 下一轮重试 */ }
@@ -267,6 +801,8 @@
       if (!st.instance || st.instance.id !== it.id) {
         st.since = 0;
         st.localOffset = 0;
+        // 换实例就换日志区，否则旧实例的行会留在屏幕上，看起来像新实例的
+        resetLogWindow(it.state === "running" || it.state === "adopted" ? "正在读取日志…" : "等待启动…");
       }
       st.instance = it;
     }
@@ -309,19 +845,20 @@
     if (!AUTO_START) return;
     const it = st.instance;
     if (!it) return;
-    if (it.state === "running" || it.state === "starting") return;
+    if (it.state === "running" || it.state === "starting" || it.state === "adopted") return;
     st.autoStarted = true;
     await act(async () => {
       it.state = "starting";
       st.since = 0;
       st.localOffset = 0;
+      resetLogWindow("正在启动…");
       render();
       try {
         await api("/api/instances/start", { id: it.id });
-        toast("已启动 " + it.name + "，就绪后将进入工作台");
+        toast("已启动 " + it.name + "，就绪后将进入工作台", "ok");
       } catch (e) {
         st.autoStarted = false;
-        toast("启动失败：" + e.message);
+        toast("启动失败：" + e.message, "err");
         throw e;
       }
       await poll();
@@ -339,11 +876,11 @@
       const it = st.instance;
       if (!it) return stopWatch();
       if (it.state === "error" || it.state === "stopped") return stopWatch();
-      if (it.state === "running" && it.url) {
+      if ((it.state === "running" || it.state === "adopted") && it.url) {
         stopWatch();
         try {
           const r = await openWorkbench(it.url);
-          if (r.ok) toast("工作台已就绪，已在应用内打开");
+          if (r.ok) toast("工作台已就绪，已在应用内打开", "ok");
         } catch (_) { /* 用户可以自己点「进入工作台」 */ }
       }
       if (attempts > 120) stopWatch();   // 约 2 分钟后放弃，避免空转
@@ -356,7 +893,7 @@
   // ---------------------------------------------------------------- 动作
   async function act(fn) {
     st.busy = true; render();
-    try { await fn(); } catch (e) { toast("操作失败：" + e.message); }
+    try { await fn(); } catch (e) { toast("操作失败：" + e.message, "err"); }
     st.busy = false; render();
   }
 
@@ -370,15 +907,15 @@
     const it = st.instance;
     if (!it) return toast("没有可用实例");
 
-    if (it.state === "running") {
+    if (it.state === "running" || it.state === "adopted") {
       const url = it.url;
       if (!url) return toast("尚未取得工作台地址");
       act(async () => {
         try {
           await openWorkbench(url);
-          toast("已在应用内打开工作台");
+          toast("已在应用内打开工作台", "ok");
         } catch (e) {
-          toast("打开失败：" + (e.message || e));
+          toast("打开失败：" + (e.message || e), "err");
         }
       });
       return;
@@ -389,9 +926,10 @@
       it.state = "starting";
       st.since = 0;
       st.localOffset = 0;
+      resetLogWindow("正在启动…");
       render();
       await api("/api/instances/start", { id: target });
-      toast("正在启动 " + it.name + "…");
+      toast("正在启动 " + it.name + "…", "info");
       await poll();
     });
     if (AUTO_OPEN) watchReadyToOpen();
@@ -405,7 +943,10 @@
     const it = st.instance;
     if (!it) return toast("没有可用实例");
 
-    if (it.state !== "running" && it.state !== "starting") {
+    if (it.state === "conflict") {
+      return toast("外部实例不归启动器管理，请用下方「仅结束外部实例」", "info");
+    }
+    if (it.state !== "running" && it.state !== "starting" && it.state !== "adopted") {
       return toast("没有正在运行的进程，无需停止");
     }
 
@@ -413,14 +954,14 @@
     act(async () => {
       stopWatch();
       await api("/api/instances/stop", { id: target });
-      toast("正在停止…");
+      toast("正在停止…", "info");
       // 等真的停下来再给结论，别只甩一句「已发送请求」
-      const done = await waitForState(target, ["stopped", "error"], 12000);
+      const done = await waitForState(target, ["stopped", "error", "unknown"], 15000);
       if (done) {
         await poll();
-        toast(done === "stopped" ? "已停止" : "已停止（异常退出）");
+        toast(done === "stopped" ? "已停止" : "已停止（异常退出）", "ok");
       } else {
-        toast("停止指令已发出，但进程仍未退出，请查看日志");
+        toast("停止指令已发出，但进程仍未退出，请查看日志", "info");
       }
     });
   });
@@ -448,6 +989,7 @@
       it.state = "starting";
       st.since = 0;
       st.localOffset = 0;
+      resetLogWindow("正在启动…");
       render();
       await api("/api/instances/start", { id: target });
       toast("当前未运行，正在启动 " + it.name + "…");
@@ -464,7 +1006,7 @@
     const it = st.instance;
     if (!it) return toast("没有可用实例");
 
-    if (it.state !== "running" && it.state !== "starting") {
+    if (it.state !== "running" && it.state !== "starting" && it.state !== "adopted") {
       return startFromRestartButton();
     }
 
@@ -474,14 +1016,15 @@
       st.instance.state = "starting";
       st.since = 0;
       st.localOffset = 0;
+      resetLogWindow("正在启动…");
       render();
       await api("/api/instances/restart", { id: target });
-      toast("正在重启…");
+      toast("正在重启…", "info");
       await poll();
       // 等它重新跑起来（或失败），再给结论
       const done = await waitForState(target, ["running", "error", "stopped"], 60000);
       await poll();
-      if (done === "running") toast("已重启，可以进入工作台");
+      if (done === "running") toast("已重启，可以进入工作台", "ok");
       else if (done) toast("重启未成功：" + LABEL[done]);
       else toast("重启耗时较长，仍在启动中，请查看日志");
     });
@@ -495,9 +1038,10 @@
       st.instance.state = "starting";
       st.since = 0;
       st.localOffset = 0;
+      resetLogWindow("正在启动…");
       render();
       await api("/api/start-safe", { id: target });
-      toast("安全启动：已跳过全部补丁");
+      toast("安全启动：已跳过全部补丁", "ok");
       await poll();
       const done = await waitForState(target, ["running", "error", "stopped"], 60000);
       await poll();
@@ -510,26 +1054,26 @@
 
   $("webPanel").addEventListener("click", () => {
     const it = st.instance;
-    if (!it || it.state !== "running") return toast("Web 服务尚未启动");
+    if (!it || (it.state !== "running" && it.state !== "adopted")) return toast("Web 服务尚未启动");
     toast("工作台端口 " + it.actualPort);
   });
 
   $("addressButton").addEventListener("click", async () => {
     const it = st.instance;
-    if (!it || it.state !== "running") return toast("请先启动 DSHA");
+    if (!it || (it.state !== "running" && it.state !== "adopted")) return toast("请先启动 DSHA");
     try {
       await openWorkbench(it.url);
-      toast("已在应用内打开工作台");
-    } catch (e) { toast("打开失败：" + (e.message || e)); }
+      toast("已在应用内打开工作台", "ok");
+    } catch (e) { toast("打开失败：" + (e.message || e), "err"); }
   });
 
   $("environmentButton").addEventListener("click", async () => {
-    toast("环境检测中…");
+    toast("环境检测中…", "info");
     try {
       const r = await api("/api/env");
       const bad = (r.items || []).filter((i) => !i.ok).map((i) => i.name);
-      toast(bad.length ? "缺失：" + bad.join("、") : "环境完整，全部就绪");
-    } catch (e) { toast("检测失败：" + e.message); }
+      toast(bad.length ? "缺失：" + bad.join("、") : "环境完整，全部就绪", bad.length ? "err" : "ok");
+    } catch (e) { toast("检测失败：" + e.message, "err"); }
   });
 
   $("recoveryButton").addEventListener("click", async () => {
@@ -542,6 +1086,7 @@
   });
 
   // ---------------------------------------------------------------- 其它
+  $("logCopy")?.addEventListener("click", copyLogs);
   $("aboutButton")?.addEventListener("click", async () => {
     const el = $("aboutVersion");
     let version = "Tauri + Java 后端";
@@ -575,7 +1120,7 @@
     document.body.classList.toggle("light");
     const light = document.body.classList.contains("light");
     localStorage.setItem("dsha.theme", light ? "light" : "dark");
-    toast(light ? "已切换浅色主题" : "已切换深色主题");
+    toast(light ? "已切换浅色主题" : "已切换深色主题", "info");
   });
 
   // 「日志」标签页：把控制台日志区滚进来，不重复开窗口
@@ -616,9 +1161,9 @@
   if (addBtn) addBtn.addEventListener("click", async () => {
     try {
       const list = await api("/api/instances/add", {});
-      toast("已新增实例，共 " + list.length + " 个");
+      toast("已新增实例，共 " + list.length + " 个", "ok");
       await refresh();
-    } catch (e) { toast("添加失败：" + e.message); }
+    } catch (e) { toast("添加失败：" + e.message, "err"); }
   });
 
 
@@ -1051,7 +1596,7 @@
               get: () => String(st.instance?.port ?? 3080),
               set: (v) => {
                 const p = parseInt(v, 10);
-                if (!p || p < 1024 || p > 65535) { toast("端口需在 1024–65535 之间"); return false; }
+                if (!p || p < 1024 || p > 65535) { toast("端口需在 1024–65535 之间", "err"); return false; }
                 return updateInstance({ port: String(p) });
               },
               check: async (v) => {
@@ -1063,9 +1608,10 @@
                 } catch (_) { return ""; }
               } },
             { name: "当前运行端口", desc: "dsh 实际监听的端口", type: "info",
-              get: () => st.instance?.state === "running"
+              get: () => (st.instance?.state === "running" || st.instance?.state === "adopted")
                 ? String(st.instance.actualPort)
-                : "未运行" },
+                : st.instance?.state === "conflict" ? "外部实例"
+                : st.instance?.state === "unknown" ? "待核验" : "未运行" },
           ],
         },
         {
@@ -1158,10 +1704,10 @@
       if (patch.port !== undefined) it.port = parseInt(patch.port, 10);
       if (patch.autoPort !== undefined) it.autoPort = patch.autoPort === "true";
       if (patch.portFallback !== undefined) it.portFallback = patch.portFallback === "true";
-      toast("已保存");
+      toast("已保存", "ok");
       return true;
     } catch (err) {
-      toast("保存失败：" + err.message);
+      toast("保存失败：" + err.message, "err");
       return false;
     }
   }
@@ -1352,6 +1898,32 @@
     if (e.key === "Escape" && settings.page) {
       e.preventDefault();
       settingsHome();
+    }
+  });
+
+  // ---- 全局快捷键：Ctrl+O 工作台 / Ctrl+R 刷新 / Ctrl+L 清空日志 ----
+  // 日志复制走鼠标：点击「复制」按钮，或在日志窗口里鼠标右键 → 复制，本身就能选中。
+  document.addEventListener("keydown", (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    const k = e.key.toLowerCase();
+    if (k === "o") {
+      e.preventDefault();
+      const it = st.instance;
+      if (!it || (it.state !== "running" && it.state !== "adopted") || !it.url) return toast("请先启动 DSHA", "info");
+      openWorkbench(it.url)
+        .then(() => toast("已在应用内打开工作台", "ok"))
+        .catch((err) => toast("打开失败：" + (err.message || err), "err"));
+    } else if (k === "r") {
+      e.preventDefault();
+      refresh()
+        .then(() => toast("已刷新", "ok"))
+        .catch(() => toast("刷新失败，后端可能未连接", "err"));
+    } else if (k === "l") {
+      e.preventDefault();
+      resetLogWindow("日志已清空（仅界面，后端日志保留）");
+      st.since = 0;
+      st.localOffset = 0;
+      toast("日志已清空（仅界面）", "info");
     }
   });
 

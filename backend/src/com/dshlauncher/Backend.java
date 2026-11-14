@@ -51,14 +51,19 @@ import java.util.regex.*;
 public class Backend {
 
     // ---------------- 常量 ----------------
-    // user.home 在正常桌面会话里就是登录用户的家目录；
-    // 支持 DSH_HOME 覆盖，便于在特殊环境（容器 / 沙箱）里调试。
-    static final String HOME = System.getenv("DSH_HOME") != null
-            && !System.getenv("DSH_HOME").isBlank()
-            ? System.getenv("DSH_HOME")
-            : System.getProperty("user.home");
-    static final Path CFG_DIR = Paths.get(HOME, ".config", "dsh-launcher");
+    // 启动器自己的路径一律跟真实家目录走。
+    // DSH_HOME 是 dsh 自己的数据目录覆盖项（本机设为 ~/.dsh），
+    // 若拿它当 HOME，实例配置会跑到 ~/.dsh/.config 下，从终端里启动就读到另一份空配置。
+    static final String HOME = System.getProperty("user.home");
+    static final String CFG_HOME = HOME;
+    static final Path CFG_DIR = Paths.get(CFG_HOME, ".config", "dsh-launcher");
+    /** 旧版把配置写在 $DSH_HOME/.config 下；首次启动时迁回标准位置。 */
+    static final Path LEGACY_CFG_FILE =
+            Paths.get(System.getenv().getOrDefault("DSH_HOME", Paths.get(HOME, ".dsh").toString()),
+                    ".config", "dsh-launcher", "instances.json");
     static final Path CFG_FILE = CFG_DIR.resolve("instances.json");
+    /** 会话记录目录：每个实例一份，含 launch token，权限 0600。 */
+    static final Path SESS_DIR = CFG_DIR.resolve("sessions");
     static final String DSH_BIN = resolveDsh();
     static final String EDGE_BIN = "/opt/microsoft/msedge/msedge";
     static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("HH:mm:ss");
@@ -69,6 +74,8 @@ public class Backend {
     /** 已验证过 token 的前端来源（CORS 白名单，避免 * 的过宽松）。 */
     static final Set<String> ALLOWED_ORIGINS = new java.util.HashSet<>(java.util.Arrays.asList(
             "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
             "http://127.0.0.1",
             "http://127.0.0.1:7080",
             "http://127.0.0.1:7081",
@@ -81,6 +88,16 @@ public class Backend {
             "http://127.0.0.1:7088",
             "http://127.0.0.1:7089"
     ));
+
+    /** Tauri WebView 的 origin 随平台不同（tauri://、http(s)://tauri.localhost），
+     *  另外 file:// 预览的 origin 是 null —— 一并放行，避免前端连不上本地后端。 */
+    static boolean isAllowedOrigin(String origin) {
+        if (origin == null) return false;
+        if (ALLOWED_ORIGINS.contains(origin)) return true;
+        if (origin.startsWith("tauri://")) return true;
+        if (origin.equals("http://tauri.localhost") || origin.equals("https://tauri.localhost")) return true;
+        return origin.equals("null");
+    }
     /** 前端异常上报速率限制：同一来源最多 50 条，防日志被刷爆。 */
     static final int MAX_FRONTEND_ERRORS = 50;
     static int frontendErrorCount = 0;
@@ -106,6 +123,14 @@ public class Backend {
         transient Process proc;
         transient final List<String> logs = Collections.synchronizedList(new ArrayList<>());
         transient int logDropped;              // 被裁掉的行数，用于校正前端下标
+        transient StartupTrace trace;          // 结构化启动时间线（阶段 / 计时 / 问题）
+        // 会话记录与接管状态（不持久化，持久化的是 SESS_DIR 下的 Session 文件）
+        transient Session session;             // 本次接回/记录的原实例
+        transient String foreignPid = "";      // conflict 时被拦下的外部 PID
+        transient String foreignCmd = "";
+        transient int foreignPort = -1;
+        transient long foreignStart;           // 外部实例出生时间，接管前二次核验
+        transient String unknownReason = "";   // unknown 状态的稳定原因码
 
         int effectivePort() { return actualPort > 0 ? actualPort : port; }
 
@@ -128,6 +153,8 @@ public class Backend {
         }
         loadConfig();
         if (inst.isEmpty()) inst.add(defaultInstance());
+        // 宿主（后端）重建时先接回上次仍在运行的实例：只核验身份与鉴权，不新建进程、不重放业务。
+        for (Instance i : inst) restoreSessionOnBoot(i);
 
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
         server.createContext("/api", new Router());
@@ -135,8 +162,21 @@ public class Backend {
         server.start();
 
         System.out.println("[dsh-backend] listening on http://127.0.0.1:" + port);
+        System.out.println("[dsh-backend] config: " + CFG_FILE);
         System.out.println("[dsh-backend] instances loaded: " + inst.size());
+        for (Instance i : inst) {
+            System.out.println("[dsh-backend]   " + i.id + " profile=" + i.profile + " state=" + i.state);
+        }
         System.out.flush();
+
+        // 周期复核接回的实例：只读核验 + 鉴权，不重放业务。
+        Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "dsha-session-recheck");
+            t.setDaemon(true);
+            return t;
+        }).scheduleWithFixedDelay(() -> {
+            try { recheckSessions(); } catch (Throwable ignored) {}
+        }, 5, 5, TimeUnit.SECONDS);
 
         // 优雅退出：关闭启动器时必须把本后端派生的 dsh 进程树一起带走，
         // 不留孤儿 node 进程。
@@ -146,6 +186,21 @@ public class Backend {
             for (Instance i : snapshot) {
                 Process p = i.proc;
                 if (p != null) killTree(p);
+            }
+            // 接回的实例没有 Process 句柄，但同样是“本启动器在管”的 dsh：
+            // 关闭启动器仍应带走它，否则会留下孤儿进程。按记录身份停，不按端口/名字。
+            for (Instance i : snapshot) {
+                Session s = i.session;
+                if (s == null || i.proc != null) continue;
+                if (observe(s) != Observation.LIVE) continue;
+                try {
+                    signalProcess(s.pid, "TERM");
+                    long deadline = System.currentTimeMillis() + 4000;
+                    while (System.currentTimeMillis() < deadline && observe(s) != Observation.EXITED) {
+                        Thread.sleep(100);
+                    }
+                    if (observe(s) != Observation.EXITED) signalProcess(s.pid, "KILL");
+                } catch (Exception ignored) {}
             }
         }, "dsh-shutdown"));
     }
@@ -289,8 +344,12 @@ public class Backend {
                         StringBuilder fb = new StringBuilder("[");
                         for (int k = 0; k < foreign.size(); k++) {
                             if (k > 0) fb.append(',');
+                            int fpid = 0;
+                            try { fpid = Integer.parseInt(foreign.get(k)[0]); } catch (Exception ignored) {}
+                            int fport = fpid > 0 ? probeForeignPort(fpid) : -1;
                             fb.append("{\"pid\":").append(foreign.get(k)[0])
                               .append(",\"profile\":\"").append(esc(profileOf(foreign.get(k)[1]))).append("\"")
+                              .append(",\"port\":").append(fport)
                               .append(",\"cmd\":\"").append(esc(foreign.get(k)[1])).append("\"}");
                         }
                         fb.append(']');
@@ -378,7 +437,7 @@ public class Backend {
                         if (t != null) {
                             String keep = t.patches;
                             t.patches = "";
-                            addLog(t, "安全启动：已跳过全部补丁");
+                            addLog(t, "安全启动：跳过实例配置里的全部补丁");
                             startInstance(t);
                             t.patches = keep;
                         }
@@ -409,40 +468,53 @@ public class Backend {
 
                     case "/api/instances/logs": {
                         Instance t = find(q.get("id"));
-                        int since = 0;
-                        try { since = Integer.parseInt(q.getOrDefault("since", "0")); } catch (Exception ignored) {}
-                        // wait=1：长轮询。有新日志立刻返回，没有就最多挂 2 秒再返回。
-                        // 前端据此做「实时」流，不必高频空转。
+                        long since = 0;
+                        try { since = Long.parseLong(q.getOrDefault("since", "0")); } catch (Exception ignored) {}
                         boolean wait = "1".equals(q.get("wait"));
-                        if (t == null) { ok(ex, "{\"lines\":[],\"total\":0,\"offset\":0}"); return; }
-
-                        long deadline = System.currentTimeMillis() + 2000L;
-                        synchronized (t.logs) {
-                            while (wait && t.logs.size() <= since
-                                    && System.currentTimeMillis() < deadline) {
-                                try { t.logs.wait(Math.max(1L, deadline - System.currentTimeMillis())); }
-                                catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-                            }
+                        if (t == null) {
+                            ok(ex, "{\"lines\":[],\"total\":0,\"offset\":0,\"entries\":[]}");
+                            return;
                         }
+
+                        StartupTrace trace = traceOf(t);
+                        if (wait) trace.awaitRevision(since, System.currentTimeMillis() + 2000L);
+                        StartupTrace.Snapshot s = trace.snapshot(System.currentTimeMillis());
+                        StartupLogDigest.Outcome outcome = outcomeOf(t);
+                        StartupLogDigest.Result digest =
+                                StartupLogDigest.digest(s.entries, outcome,
+                                        StartupLogDigest.endMs(s, outcome));
 
                         StringBuilder sb = new StringBuilder("{\"lines\":[");
-                        int total;
-                        // offset = 本次首行在全量日志里的下标，前端用它做累计行数
-                        int offset;
-                        synchronized (t.logs) {
-                            total = t.logs.size();
-                            offset = Math.min(Math.max(0, since), total);
-                            for (int k = offset; k < total; k++) {
-                                if (k > offset) sb.append(',');
-                                sb.append('"').append(esc(t.logs.get(k))).append('"');
-                            }
+                        int total = s.entries.size();
+                        // since 是 revision 游标，不是行下标：拿不到增量就退回全量，
+                        // 保证前端永远有新内容可渲染（环形裁剪后下标会错位）。
+                        int from = 0;
+                        if (s.revision > since && since > 0) {
+                            long delta = s.revision - since;
+                            from = (int) Math.max(0, total - delta);
+                        }
+                        for (int k = from; k < total; k++) {
+                            if (k > from) sb.append(',');
+                            sb.append('"').append(esc(s.entries.get(k).line)).append('"');
                         }
                         sb.append("],\"total\":").append(total)
-                          .append(",\"offset\":").append(offset)
-                          .append(",\"dropped\":").append(t.logDropped)
+                          .append(",\"offset\":").append(from)
+                          .append(",\"dropped\":").append(s.dropped)
+                          .append(",\"revision\":").append(s.revision)
+                          .append(",\"entryLines\":[");
+                        for (int k = from; k < total; k++) {
+                            StartupTrace.Entry e = s.entries.get(k);
+                            if (k > from) sb.append(',');
+                            sb.append('"').append(esc(e.line)).append('"');
+                        }
+                        sb.append("],\"stages\":").append(stagesJson(digest))
+                          .append(",\"outcome\":\"").append(outcome.name()).append("\"")
+                          .append(",\"issueCount\":").append(digest.issueCount)
+                          .append(",\"stage\":\"").append(esc(s.stage)).append("\"")
+                          .append(",\"elapsedMs\":").append(s.elapsedMs)
                           .append(",\"state\":\"").append(t.state).append("\"")
                           .append(",\"port\":").append(t.effectivePort())
-                          .append(",\"url\":\"").append(t.url()).append("\"}");
+                          .append(",\"url\":\"").append(esc(t.url())).append("\"}");
                         ok(ex, sb.toString());
                         return;
                     }
@@ -525,11 +597,228 @@ public class Backend {
                         return;
                     }
 
+                    // 会话记录与接管：只做核验、接回、退休，不启动/停止业务。
+                    case "/api/instances/session": {
+                        Instance t = find(jsonVal(body, "id"));
+                        if (t == null) { ok(ex, "{\"ok\":false,\"error\":\"找不到实例\"}"); return; }
+                        Session s = t.session != null ? t.session : readSession(t);
+                        if (s == null) { ok(ex, "{\"ok\":true,\"session\":null}"); return; }
+                        Observation o = observe(s);
+                        ok(ex, "{\"ok\":true,\"session\":{\"pid\":" + s.pid
+                                + ",\"startTime\":" + s.startTime
+                                + ",\"port\":" + s.port
+                                + ",\"profile\":\"" + esc(s.profile) + "\""
+                                + ",\"hasToken\":" + (s.authUrl != null && s.authUrl.contains("token="))
+                                + ",\"generation\":" + s.generation
+                                + ",\"observation\":\"" + o.name() + "\""
+                                + ",\"cmdline\":\"" + esc(s.cmdline) + "\"}}");
+                        return;
+                    }
+
+                    // 重新核验：只读观察 + 真实鉴权，成功才恢复 adopted。
+                    case "/api/instances/recheck": {
+                        Instance t = find(jsonVal(body, "id"));
+                        if (t == null) { ok(ex, "{\"ok\":false,\"error\":\"找不到实例\"}"); return; }
+                        Session s = t.session != null ? t.session : readSession(t);
+                        if (s == null) {
+                            ok(ex, "{\"ok\":true,\"result\":\"NONE\",\"state\":\"" + t.state + "\"}");
+                            return;
+                        }
+                        Observation o = observe(s);
+                        String result;
+                        if (o == Observation.EXITED) {
+                            clearSession(t, s);
+                            t.session = null;
+                            t.state = "stopped";
+                            t.actualPort = -1;
+                            t.workbenchUrl = "";
+                            t.unknownReason = "";
+                            result = "EXITED";
+                            addLog(t, "重新核验：原 dsh（PID " + s.pid + "）已确认退出。");
+                        } else if (o == Observation.UNKNOWN) {
+                            t.session = s;
+                            t.state = "unknown";
+                            t.unknownReason = "IDENTITY_UNKNOWN";
+                            result = "UNKNOWN";
+                        } else if (authenticate(s.authUrl)) {
+                            adopt(t, s);
+                            result = "RESTORED";
+                            addLog(t, "重新核验通过，已接回 dsh（PID " + s.pid + "）。");
+                        } else {
+                            t.session = s;
+                            t.state = "unknown";
+                            t.unknownReason = "AUTH_UNAVAILABLE";
+                            result = "AUTH_FAILED";
+                        }
+                        ok(ex, "{\"ok\":true,\"result\":\"" + result + "\",\"state\":\"" + t.state + "\"}");
+                        return;
+                    }
+
+                    // 确认已退出：用户明确声明原实例已不在，才允许退休记录。
+                    case "/api/instances/forget": {
+                        Instance t = find(jsonVal(body, "id"));
+                        if (t == null) { ok(ex, "{\"ok\":false,\"error\":\"找不到实例\"}"); return; }
+                        Session s = t.session != null ? t.session : readSession(t);
+                        if (s != null && observe(s) == Observation.LIVE) {
+                            ok(ex, "{\"ok\":false,\"error\":\"进程仍存活，不能退休记录；请先停止它\"}");
+                            return;
+                        }
+                        clearSession(t, s);
+                        t.session = null;
+                        t.state = "stopped";
+                        t.actualPort = -1;
+                        t.workbenchUrl = "";
+                        t.unknownReason = "";
+                        addLog(t, "已确认退出，会话记录已退休。");
+                        ok(ex, "{\"ok\":true,\"state\":\"" + t.state + "\"}");
+                        return;
+                    }
+
+                    // 只结束外部实例（不启动）：二次核验 PID 出生身份后才发信号。
+                    case "/api/instances/kill-foreign": {
+                        Instance t = find(jsonVal(body, "id"));
+                        if (t == null) { ok(ex, "{\"ok\":false,\"error\":\"找不到实例\"}"); return; }
+                        String pidStr = t.foreignPid;
+                        if (pidStr == null || pidStr.isBlank()) {
+                            List<String[]> foreign = findForeignDsh(t.profile);
+                            if (!foreign.isEmpty()) pidStr = foreign.get(0)[0];
+                        }
+                        int fpid;
+                        try { fpid = Integer.parseInt(pidStr); } catch (Exception e) { fpid = -1; }
+                        if (fpid <= 1) { ok(ex, "{\"ok\":false,\"error\":\"没有可结束的外部 dsh\"}"); return; }
+                        String cmd = procCmdline(fpid);
+                        long started = procStartTime(fpid);
+                        if (cmd.isEmpty() || started <= 0) {
+                            ok(ex, "{\"ok\":false,\"error\":\"该进程已不存在\"}"); return;
+                        }
+                        if (!t.foreignCmd.isBlank() && !cmd.equals(t.foreignCmd)) {
+                            ok(ex, "{\"ok\":false,\"error\":\"PID 已被其它进程复用，已取消\"}"); return;
+                        }
+                        addLog(t, "结束外部 dsh（PID " + fpid + "）…");
+                        signalProcess(fpid, "TERM");
+                        long deadline = System.currentTimeMillis() + 8000;
+                        while (System.currentTimeMillis() < deadline && procStartTime(fpid) == started) {
+                            try { Thread.sleep(120); } catch (InterruptedException ignored) { break; }
+                        }
+                        if (procStartTime(fpid) == started) signalProcess(fpid, "KILL");
+                        long hard = System.currentTimeMillis() + 4000;
+                        while (System.currentTimeMillis() < hard && procStartTime(fpid) == started) {
+                            try { Thread.sleep(100); } catch (InterruptedException ignored) { break; }
+                        }
+                        boolean gone = procStartTime(fpid) != started;
+                        if (gone) {
+                            t.foreignPid = ""; t.foreignCmd = ""; t.foreignPort = -1;
+                            t.state = "stopped"; t.actualPort = -1; t.workbenchUrl = "";
+                            addLog(t, "外部 dsh 已确认退出。");
+                        }
+                        ok(ex, "{\"ok\":" + gone + ",\"state\":\"" + t.state + "\""
+                                + (gone ? "" : ",\"error\":\"外部 dsh 未确认退出\"") + "}");
+                        return;
+                    }
+
+                    // 接管重启：先按记录身份停掉外部 dsh，再走正常启动。
+                    case "/api/instances/reclaim": {
+                        Instance t = find(jsonVal(body, "id"));
+                        if (t == null) { ok(ex, "{\"ok\":false,\"error\":\"找不到实例\"}"); return; }
+                        String pidStr = t.foreignPid;
+                        if (pidStr == null || pidStr.isBlank()) {
+                            List<String[]> foreign = findForeignDsh(t.profile);
+                            if (!foreign.isEmpty()) pidStr = foreign.get(0)[0];
+                        }
+                        if (pidStr == null || pidStr.isBlank()) {
+                            ok(ex, "{\"ok\":false,\"error\":\"没有可接管的外部 dsh\"}");
+                            return;
+                        }
+                        int fpid;
+                        try { fpid = Integer.parseInt(pidStr); } catch (Exception e) { fpid = -1; }
+                        if (fpid <= 1) { ok(ex, "{\"ok\":false,\"error\":\"PID 无效\"}"); return; }
+                        // 二次核验：PID 仍在、命令行仍是 dsh、profile 仍一致
+                        String cmd = procCmdline(fpid);
+                        long started = procStartTime(fpid);
+                        if (cmd.isEmpty() || started <= 0) {
+                            ok(ex, "{\"ok\":false,\"error\":\"该进程已不存在\"}");
+                            return;
+                        }
+                        if (!t.foreignCmd.isBlank() && !cmd.equals(t.foreignCmd)) {
+                            ok(ex, "{\"ok\":false,\"error\":\"PID 已被其它进程复用，已取消接管\"}");
+                            return;
+                        }
+                        addLog(t, "接管：正在结束外部 dsh（PID " + fpid + "）…");
+                        signalProcess(fpid, "TERM");
+                        long deadline = System.currentTimeMillis() + 8000;
+                        while (System.currentTimeMillis() < deadline) {
+                            if (procStartTime(fpid) != started) break;
+                            try { Thread.sleep(120); } catch (InterruptedException ignored) { break; }
+                        }
+                        if (procStartTime(fpid) == started) {
+                            signalProcess(fpid, "KILL");
+                            long hard = System.currentTimeMillis() + 4000;
+                            while (System.currentTimeMillis() < hard && procStartTime(fpid) == started) {
+                                try { Thread.sleep(100); } catch (InterruptedException ignored) { break; }
+                            }
+                        }
+                        if (procStartTime(fpid) == started) {
+                            ok(ex, "{\"ok\":false,\"error\":\"外部 dsh 未确认退出，接管已中止\"}");
+                            return;
+                        }
+                        addLog(t, "外部 dsh 已退出，开始启动新实例。");
+                        t.foreignPid = "";
+                        t.foreignCmd = "";
+                        t.foreignPort = -1;
+                        t.state = "stopped";
+                        startInstance(t);
+                        ok(ex, "{\"ok\":true,\"state\":\"" + t.state + "\",\"instance\":" + instanceJson(t) + "}");
+                        return;
+                    }
+
+                    // 附着打开：外部 dsh 的 token 不可得，只返回端口，由用户自行粘贴地址。
+                    case "/api/instances/attach": {
+                        Instance t = find(jsonVal(body, "id"));
+                        if (t == null) { ok(ex, "{\"ok\":false,\"error\":\"找不到实例\"}"); return; }
+                        int p = t.foreignPort > 0 ? t.foreignPort : -1;
+                        if (p <= 0 && !t.foreignPid.isBlank()) {
+                            try { p = probeForeignPort(Integer.parseInt(t.foreignPid)); } catch (Exception ignored) {}
+                        }
+                        if (p <= 0) {
+                            ok(ex, "{\"ok\":false,\"error\":\"未能确定外部 dsh 的监听端口\"}");
+                            return;
+                        }
+                        String url = "http://127.0.0.1:" + p + "/";
+                        boolean launched = false;
+                        try {
+                            new ProcessBuilder("xdg-open", url).redirectErrorStream(true).start();
+                            launched = true;
+                        } catch (Exception ignored) {}
+                        ok(ex, "{\"ok\":true,\"port\":" + p + ",\"url\":\"" + esc(url)
+                                + "\",\"launched\":" + launched
+                                + ",\"note\":\"该实例的 token 只在启动时打印过，需自行粘贴带 token 的完整地址\"}");
+                        return;
+                    }
+
                     // 实例健康检查：检查 dsh 进程是否还在运行，如果不在了自动尝试重启
                     case "/api/instances/health": {
                         Instance t = find(jsonVal(body, "id"));
                         if (t == null) {
                             ok(ex, "{\"ok\":false,\"error\":\"找不到实例\"}");
+                            return;
+                        }
+                        // 接回的实例没有 Process 句柄，健康判据是内核身份 + 鉴权。
+                        if ("adopted".equals(t.state) && t.session != null) {
+                            Observation o = observe(t.session);
+                            if (o == Observation.EXITED) {
+                                clearSession(t, t.session);
+                                t.session = null;
+                                t.state = "stopped";
+                                t.actualPort = -1;
+                                t.workbenchUrl = "";
+                                ok(ex, "{\"ok\":true,\"healthy\":false,\"autoRestarted\":false,\"state\":\"stopped\"}");
+                            } else if (o == Observation.UNKNOWN) {
+                                t.state = "unknown";
+                                t.unknownReason = "IDENTITY_UNKNOWN";
+                                ok(ex, "{\"ok\":true,\"healthy\":false,\"autoRestarted\":false,\"state\":\"unknown\"}");
+                            } else {
+                                ok(ex, "{\"ok\":true,\"healthy\":true,\"autoRestarted\":false,\"state\":\"adopted\"}");
+                            }
                             return;
                         }
                         boolean processAlive = t.proc != null && t.proc.isAlive();
@@ -582,24 +871,404 @@ public class Backend {
     }
 
     // =====================================================================
+    //                    会话记录 / 接管（adopt）机制
+    //  参考 DSHA(Android) 的 WebSessionRecovery：先核验内核身份，再真实鉴权，
+    //  二次核验后才接回；任何不确定都保持屏障，绝不当作“已退出”。
+    // =====================================================================
+
+    /** 一次已确认（或待确认）的 dsh 实例身份。含 launch token，文件权限 0600。 */
+    static class Session {
+        int pid;
+        long startTime;      // /proc/PID/stat 第 22 字段（时钟滴答），PID 复用判据
+        String bootId = "";
+        int uid;
+        String cmdline = "";
+        long generation;     // 每次启动递增，防止旧回调删除新记录
+        int port = -1;
+        String authUrl = "";
+        String profile = "";
+        String instanceId = "";
+        long savedAt;
+
+        String key() { return pid + ":" + startTime + ":" + bootId; }
+    }
+
+    enum Observation { LIVE, EXITED, UNKNOWN }
+
+    static final java.util.concurrent.atomic.AtomicLong GENERATION =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    static String bootId() {
+        try {
+            return Files.readString(Paths.get("/proc/sys/kernel/random/boot_id"), StandardCharsets.UTF_8).trim();
+        } catch (Exception e) { return ""; }
+    }
+
+    /** /proc/PID/stat 的 starttime（字段 22）。进程不存在返回 -1。 */
+    static long procStartTime(int pid) {
+        try {
+            String s = Files.readString(Paths.get("/proc", String.valueOf(pid), "stat"), StandardCharsets.UTF_8);
+            int rp = s.lastIndexOf(')');
+            if (rp < 0) return -1;
+            String[] f = s.substring(rp + 1).trim().split("\\s+");
+            // 字段 3 是 state，索引 0 对应字段 3；starttime 是字段 22 → 索引 19
+            if (f.length < 20) return -1;
+            return Long.parseLong(f[19]);
+        } catch (Exception e) { return -1; }
+    }
+
+    static String procCmdline(int pid) {
+        try {
+            byte[] raw = Files.readAllBytes(Paths.get("/proc", String.valueOf(pid), "cmdline"));
+            return new String(raw, StandardCharsets.UTF_8).replace('\0', ' ').trim();
+        } catch (Exception e) { return ""; }
+    }
+
+    static int procUid(int pid) {
+        try {
+            for (String line : Files.readAllLines(Paths.get("/proc", String.valueOf(pid), "status"))) {
+                if (line.startsWith("Uid:")) return Integer.parseInt(line.substring(4).trim().split("\\s+")[0]);
+            }
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    static Path sessionFile(Instance i) { return SESS_DIR.resolve(i.id + ".json"); }
+
+    static void saveSession(Instance i, Session s) {
+        if (s == null) return;
+        try {
+            Files.createDirectories(SESS_DIR);
+            s.savedAt = System.currentTimeMillis();
+            String js = "{"
+                    + "\"pid\":" + s.pid + ","
+                    + "\"startTime\":" + s.startTime + ","
+                    + "\"bootId\":\"" + esc(s.bootId) + "\","
+                    + "\"uid\":" + s.uid + ","
+                    + "\"cmdline\":\"" + esc(s.cmdline) + "\","
+                    + "\"generation\":" + s.generation + ","
+                    + "\"port\":" + s.port + ","
+                    + "\"authUrl\":\"" + esc(s.authUrl) + "\","
+                    + "\"profile\":\"" + esc(s.profile) + "\","
+                    + "\"instanceId\":\"" + esc(s.instanceId) + "\","
+                    + "\"savedAt\":" + s.savedAt
+                    + "}";
+            Path f = sessionFile(i);
+            Files.createDirectories(f.getParent());
+            Files.writeString(f, js, StandardCharsets.UTF_8);
+            try {
+                Files.setPosixFilePermissions(f, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+            } catch (Exception ignored) {}
+        } catch (Exception ignored) {}
+    }
+
+    static Session readSession(Instance i) {
+        Path f = sessionFile(i);
+        if (!Files.exists(f)) return null;
+        try {
+            Map<String, String> d = flatJson(Files.readString(f, StandardCharsets.UTF_8));
+            Session s = new Session();
+            s.pid = Integer.parseInt(d.getOrDefault("pid", "0"));
+            s.startTime = Long.parseLong(d.getOrDefault("startTime", "-1"));
+            s.bootId = d.getOrDefault("bootId", "");
+            s.uid = Integer.parseInt(d.getOrDefault("uid", "-1"));
+            s.cmdline = d.getOrDefault("cmdline", "");
+            s.generation = Long.parseLong(d.getOrDefault("generation", "0"));
+            s.port = Integer.parseInt(d.getOrDefault("port", "-1"));
+            s.authUrl = d.getOrDefault("authUrl", "");
+            s.profile = d.getOrDefault("profile", "");
+            s.instanceId = d.getOrDefault("instanceId", "");
+            s.savedAt = Long.parseLong(d.getOrDefault("savedAt", "0"));
+            if (s.pid <= 1 || s.startTime <= 0) return null;
+            return s;
+        } catch (Exception e) { return null; }
+    }
+
+    /** 只有记录仍与当前文件一致才删除；旧回调不能删掉新记录。 */
+    static void clearSession(Instance i, Session expected) {
+        try {
+            Path f = sessionFile(i);
+            if (!Files.exists(f)) return;
+            if (expected != null) {
+                Session cur = readSession(i);
+                if (cur == null || cur.generation != expected.generation) return;
+            }
+            Files.delete(f);
+        } catch (Exception ignored) {}
+    }
+
+    /** 内核身份核验：只有 boot 结束、PID 退出或出生变化才能判 EXITED。 */
+    static Observation observe(Session s) {
+        if (s == null) return Observation.EXITED;
+        if (!s.bootId.isEmpty() && !s.bootId.equals(bootId())) return Observation.EXITED;
+        long started = procStartTime(s.pid);
+        if (started < 0) return Observation.EXITED;          // PID 已不存在
+        if (started != s.startTime) return Observation.EXITED; // PID 被复用
+        int uid = procUid(s.pid);
+        if (uid >= 0 && s.uid >= 0 && uid != s.uid) return Observation.EXITED;
+        String cmd = procCmdline(s.pid);
+        if (cmd.isEmpty()) return Observation.UNKNOWN;        // 读不到，不等于退出
+        if (!cmd.equals(s.cmdline)) return Observation.UNKNOWN;
+        return Observation.LIVE;
+    }
+
+    /** 真实 HTTP 鉴权：带 token 的根路径应签发 cookie 并 302；200 也算已授权。 */
+    static boolean authenticate(String authUrl) {
+        if (authUrl == null || authUrl.isBlank()) return false;
+        java.net.HttpURLConnection c = null;
+        try {
+            java.net.URL u = new java.net.URL(authUrl);
+            if (!"http".equals(u.getProtocol()) && !"https".equals(u.getProtocol())) return false;
+            c = (java.net.HttpURLConnection) u.openConnection();
+            c.setConnectTimeout(4000);
+            c.setReadTimeout(4000);
+            c.setInstanceFollowRedirects(false);
+            c.setRequestMethod("GET");
+            c.setRequestProperty("User-Agent", "dsha-launcher/adopt");
+            int code = c.getResponseCode();
+            return code == 200 || code == 204 || code == 302 || code == 303;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (c != null) try { c.disconnect(); } catch (Exception ignored) {}
+        }
+    }
+
+    /** 接回已核验的实例：只改本地状态，不启动、不停止、不重放业务。 */
+    static void adopt(Instance i, Session s) {
+        i.session = s;
+        i.proc = null;
+        i.state = "adopted";
+        i.actualPort = s.port;
+        i.workbenchUrl = s.authUrl == null ? "" : s.authUrl;
+        i.unknownReason = "";
+        i.foreignPid = "";
+        i.foreignCmd = "";
+        i.foreignPort = -1;
+    }
+
+    /** 后端启动时接回上次记录：LIVE+鉴权成功 → adopted；不确定 → unknown；确认退出 → 退休。 */
+    static void restoreSessionOnBoot(Instance i) {
+        Session s = readSession(i);
+        if (s == null) {
+            // 没有记录，但系统里可能已有同 profile 的 dsh（例如上次由旧版本拉起）：
+            // 直接标记冲突，让界面第一时间显示真实情况，而不是假装“未运行”。
+            List<String[]> foreign = findForeignDsh(i.profile);
+            if (!foreign.isEmpty()) {
+                int fpid = 0;
+                try { fpid = Integer.parseInt(foreign.get(0)[0]); } catch (Exception ignored) {}
+                i.foreignPid = foreign.get(0)[0];
+                i.foreignCmd = foreign.get(0)[1];
+                i.foreignPort = fpid > 0 ? probeForeignPort(fpid) : -1;
+                i.foreignStart = fpid > 0 ? procStartTime(fpid) : -1;
+                i.state = "conflict";
+                i.actualPort = i.foreignPort;
+                addLog(i, "检测到非本启动器拉起的 dsh（PID " + i.foreignPid
+                        + (i.foreignPort > 0 ? "，端口 " + i.foreignPort : "")
+                        + "），已标记为外部实例。");
+            }
+            return;
+        }
+        i.session = s;
+        Observation o = observe(s);
+        if (o == Observation.EXITED) {
+            clearSession(i, s);
+            i.session = null;
+            addLog(i, "上次运行的 dsh（PID " + s.pid + "）已确认退出，记录已退休。");
+            return;
+        }
+        if (o == Observation.UNKNOWN) {
+            i.state = "unknown";
+            i.unknownReason = "IDENTITY_UNKNOWN";
+            addLog(i, "上次运行的 dsh（PID " + s.pid + "）身份未确认，已保留屏障；请点「重新核验」或「确认已退出」。");
+            return;
+        }
+        if (authenticate(s.authUrl)) {
+            adopt(i, s);
+            addLog(i, "已接回上次运行的 dsh（PID " + s.pid + "，端口 " + s.port + "），未重启。");
+        } else {
+            i.state = "unknown";
+            i.unknownReason = "AUTH_UNAVAILABLE";
+            addLog(i, "上次运行的 dsh（PID " + s.pid + "）仍在，但鉴权未通过；保留屏障，请点「重新核验」。");
+        }
+    }
+
+    /** 周期复核：只读观察 + 鉴权，不启动/停止/重放。 */
+    static void recheckSessions() {
+        List<Instance> snapshot;
+        synchronized (inst) { snapshot = new ArrayList<>(inst); }
+        for (Instance i : snapshot) {
+            Session s = i.session;
+            if (s == null) continue;
+            if (!"adopted".equals(i.state) && !"unknown".equals(i.state)) continue;
+            Observation o = observe(s);
+            if (o == Observation.EXITED) {
+                clearSession(i, s);
+                synchronized (i) {
+                    i.session = null;
+                    i.state = "stopped";
+                    i.actualPort = -1;
+                    i.workbenchUrl = "";
+                    i.unknownReason = "";
+                }
+                addLog(i, "接回的 dsh 已确认退出（PID " + s.pid + "）。");
+                continue;
+            }
+            if (o == Observation.UNKNOWN) {
+                synchronized (i) {
+                    i.state = "unknown";
+                    i.unknownReason = "IDENTITY_UNKNOWN";
+                }
+                continue;
+            }
+            if ("adopted".equals(i.state)) continue;
+            // unknown 但身份已 LIVE：再试一次鉴权，成功才恢复
+            if (authenticate(s.authUrl)) {
+                synchronized (i) { adopt(i, s); }
+                addLog(i, "复核通过，已重新接回 dsh（PID " + s.pid + "）。");
+            }
+        }
+    }
+
+    // =====================================================================
     //                           实例启停
     // =====================================================================
+    /**
+     * 探测某个外部 dsh 进程实际监听的端口。
+     *
+     * 只做同 uid 的只读匹配：先收集该进程持有的 socket inode（/proc/PID/fd → socket:[n]），
+     * 再在 /proc/net/tcp{,6} 里找状态为 LISTEN(0A) 且 inode 相符的本地端口。
+     * 读不到就返回 -1 —— 不猜、不按端口反查进程。
+     */
+    static int probeForeignPort(int pid) {
+        Set<String> inodes = new HashSet<>();
+        try {
+            File[] fds = new File("/proc/" + pid + "/fd").listFiles();
+            if (fds != null) {
+                for (File fd : fds) {
+                    try {
+                        String target = Files.readSymbolicLink(fd.toPath()).toString();
+                        if (target.startsWith("socket:[")) {
+                            inodes.add(target.substring(8, target.length() - 1));
+                        }
+                    } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {}
+        if (inodes.isEmpty()) return -1;
+
+        for (String table : new String[]{"/proc/net/tcp", "/proc/net/tcp6"}) {
+            try {
+                List<String> lines = Files.readAllLines(Paths.get(table));
+                for (String line : lines) {
+                    String[] f = line.trim().split("\\s+");
+                    // sl local_address rem_address st ... uid timeout inode
+                    if (f.length < 10) continue;
+                    if (!"0A".equals(f[3])) continue;           // LISTEN
+                    if (!inodes.contains(f[9])) continue;
+                    String local = f[1];
+                    int colon = local.lastIndexOf(':');
+                    if (colon < 0) continue;
+                    int p = Integer.parseInt(local.substring(colon + 1), 16);
+                    if (p > 1024 && p < 65536) return p;
+                }
+            } catch (Exception ignored) {}
+        }
+        return -1;
+    }
+
+    /** 读取 /proc/PID/stat 的 pgrp（字段 5）。读不到返回 -1。 */
+    static int procPgid(int pid) {
+        try {
+            String s = Files.readString(Paths.get("/proc", String.valueOf(pid), "stat"), StandardCharsets.UTF_8);
+            int rp = s.lastIndexOf(')');
+            if (rp < 0) return -1;
+            String[] f = s.substring(rp + 1).trim().split("\\s+");
+            if (f.length < 3) return -1;
+            return Integer.parseInt(f[2]);
+        } catch (Exception e) { return -1; }
+    }
+
+    /**
+     * 向一个进程发信号。
+     *
+     * 只有它自己是进程组首领（pgrp == pid，通常由 setsid 产生）时才整组发送；
+     * 否则只发给这个 PID —— 外部 dsh 可能与用户的 shell 同组，整组会误伤。
+     */
+    static void signalProcess(int pid, String signal) {
+        if (pid <= 1) return;
+        int pgid = procPgid(pid);
+        if (pgid == pid) {
+            killGroup(pid, signal);
+            return;
+        }
+        try {
+            new ProcessBuilder("kill", "-" + signal, "--", String.valueOf(pid))
+                    .redirectErrorStream(true)
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .start()
+                    .waitFor(1, TimeUnit.SECONDS);
+        } catch (Exception ignored) {}
+    }
+
     static void startInstance(Instance i) {
         if (i.state.equals("running") || i.state.equals("starting")) return;
+        // 已接回的实例不重启：用户点“启动”时应先走停止/接管流程。
+        if ("adopted".equals(i.state)) {
+            addLog(i, "该 dsh 已接回并在运行（PID " + (i.session == null ? "?" : i.session.pid)
+                    + "），未重启。需要重启请点「重启」或先停止。");
+            return;
+        }
 
-        // 同一个 profile 只允许一个 dsh：dsh 的排他锁按 profile 加，
-        // 起了第二个会报「当前会话已被占用」。不同 profile 可以并存，不拦。
+        // 1) 先看自己的会话记录：LIVE 就接回，UNKNOWN 保持屏障，确认退出才继续。
+        Session saved = readSession(i);
+        if (saved != null) {
+            Observation o = observe(saved);
+            if (o == Observation.UNKNOWN) {
+                i.session = saved;
+                i.state = "unknown";
+                i.unknownReason = "IDENTITY_UNKNOWN";
+                addLog(i, "上次的 dsh（PID " + saved.pid + "）身份未确认，启动被屏障拦住。"
+                        + "请点「重新核验」，或确认它已退出后点「确认已退出」。");
+                return;
+            }
+            if (o == Observation.LIVE) {
+                if (authenticate(saved.authUrl)) {
+                    adopt(i, saved);
+                    addLog(i, "检测到 dsh 仍在运行（PID " + saved.pid + "），已接回，未重启。");
+                    return;
+                }
+                i.session = saved;
+                i.state = "unknown";
+                i.unknownReason = "AUTH_UNAVAILABLE";
+                addLog(i, "dsh 进程（PID " + saved.pid + "）仍在，但鉴权失败；已保留屏障，未重启。"
+                        + "请点「重新核验」，或确认后点「确认已退出」。");
+                return;
+            }
+            // EXITED：记录已失效，退休后继续正常启动
+            clearSession(i, saved);
+            i.session = null;
+            addLog(i, "上次的 dsh（PID " + saved.pid + "）已确认退出，继续启动。");
+        }
+
+        // 2) 再看系统里同 profile 的外部 dsh：不硬拒，也不抢杀，标记 conflict 交给用户决定。
         List<String[]> foreign = findForeignDsh(i.profile);
         if (!foreign.isEmpty()) {
-            StringBuilder sb = new StringBuilder(
-                    "profile " + i.profile + " 已有一个 dsh 在运行，为避免会话锁冲突，本次启动已取消。");
-            for (String[] f : foreign) {
-                sb.append("\n  PID ").append(f[0]).append("  ").append(f[1]);
-            }
-            sb.append("\n请先在终端结束它：kill ").append(foreign.get(0)[0])
-              .append("（或 pkill -f \"bin.js --profile ").append(i.profile).append("\"）");
-            i.state = "error";
-            addLog(i, sb.toString());
+            String pid = foreign.get(0)[0];
+            String cmd = foreign.get(0)[1];
+            int fport = probeForeignPort(Integer.parseInt(pid));
+            i.foreignPid = pid;
+            i.foreignCmd = cmd;
+            i.foreignPort = fport;
+            i.foreignStart = procStartTime(Integer.parseInt(pid));
+            i.state = "conflict";
+            i.actualPort = fport > 0 ? fport : -1;
+            i.workbenchUrl = "";
+            // 「拦下外部实例」是一次事件，不是阶段：用普通行记，别让它变成一个永不结束的阶段。
+            addLog(i, "已拦下外部 dsh（PID " + pid + (fport > 0 ? "，端口 " + fport : "") + "）");
+            addLog(i, "它的 launch token 只在启动时打印过一次，启动器取不到，不能自动接回。");
+            addLog(i, "可选：①「附着打开」用端口访问（需自己粘贴带 token 的地址）"
+                    + "；②「接管重启」结束它并由启动器重新拉起；③ 手动结束后再启动。");
             return;
         }
 
@@ -608,7 +1277,7 @@ public class Backend {
         boolean useAuto = i.autoPort;
         if (!useAuto && isPortOpen(i.port)) {
             if (i.portFallback) {
-                addLog(i, "端口 " + i.port + " 已被占用，按设置自动回退到随机端口（不会结束任何进程）");
+                addLog(i, "端口 " + i.port + " 已被占用 → 自动改用随机端口（不会结束任何进程）");
                 useAuto = true;
             } else {
                 i.state = "error";
@@ -638,7 +1307,16 @@ public class Backend {
         i.state = "starting";
         i.actualPort = -1;
         i.workbenchUrl = "";
-        addLog(i, "正在启动 " + i.name + " …");
+        i.unknownReason = "";
+        i.foreignPid = "";
+        i.foreignCmd = "";
+        i.foreignPort = -1;
+        // 新一轮启动：重置结构化时间线（阶段、计时、问题一起清）
+        traceOf(i).begin(System.currentTimeMillis(), false);
+        logStage(i, "准备启动");
+        addLog(i, i.mode.equals("local")
+                ? "启动方式：npx（本地源码），profile " + i.profile
+                : "启动方式：dsh 全局命令，profile " + i.profile);
 
         List<String> cmd = new ArrayList<>();
         cmd.add(i.mode.equals("local") ? "npx" : DSH_BIN);
@@ -650,7 +1328,7 @@ public class Backend {
         cmd.add(String.valueOf(autoPortFinal ? 0 : i.port));
         for (String p : patchList(i)) { cmd.add("--patch"); cmd.add(expand(p)); }
 
-        addLog(i, "$ " + String.join(" ", cmd));
+        addLog(i, "$ " + prettyCmd(cmd));
 
         try {
             // 尝试用 setsid 让 dsh 独立成进程组，便于整组清理；
@@ -697,6 +1375,8 @@ public class Backend {
             }
             i.proc = proc;
             final Process running = proc;
+            logStage(i, "等待工作台地址");
+            addLog(i, "已派生进程 PID " + proc.pid());
 
             Thread reader = new Thread(() -> {
                 try (BufferedReader r = new BufferedReader(
@@ -706,16 +1386,17 @@ public class Backend {
                     Pattern pUrl = Pattern.compile("(https?://(?:127\\.0\\.0\\.1|localhost):(\\d{2,5})/\\S*?(?:\\?token=[^\\s\"']+)?)");
                     String ln;
                     while ((ln = r.readLine()) != null) {
-                        addLog(i, ln);
-
-                        // 先抓完整工作台地址（含 token），它同时能确定端口
+                        // 先抓地址再决定要不要展示：就绪那一行会被下面的
+                        // 「▸ 服务已就绪」顶掉，免得同一条 URL 印两遍。
                         Matcher mu = pUrl.matcher(ln);
+                        boolean readyLine = false;
                         if (mu.find()) {
                             String full = mu.group(1);
                             int cand = Integer.parseInt(mu.group(2));
                             if (cand > 1024) {
                                 i.actualPort = cand;
                                 i.workbenchUrl = full;
+                                readyLine = true;
                             }
                         }
 
@@ -726,18 +1407,33 @@ public class Backend {
                                 if (cand > 1024) i.actualPort = cand;
                             }
                         }
+
+                        if (!readyLine) {
+                            addLog(i, ln, true);
+                        } else if (!i.state.equals("starting")) {
+                            // 已经就绪后重复打印的地址（例如 token 变化）仍然保留，
+                            // 但只留一行，不打码以外的修饰。
+                            addLog(i, "工作台地址已更新 → " + maskSecrets(i.url()));
+                        }
+
                         if (i.actualPort > 0 && i.state.equals("starting") && !i.workbenchUrl.isEmpty()) {
                             i.state = "running";
-                            addLog(i, "服务已就绪 \u2192 " + i.url());
+                            // 记下 token，之后凡是它出现在日志里都会被替换成 ***
+                            logStage(i, "服务已就绪");
+                            traceOf(i).ready(System.currentTimeMillis());
+                            // token 不遮蔽：这是本机地址，用户要能直接复制到浏览器
+                            addLog(i, "工作台地址 → " + i.url());
+                            recordRunningSession(i, running.pid());
                         }
                     }
                 } catch (Exception ignored) {}
 
                 try {
                     int code = running.waitFor();
-                    if (!i.state.equals("stopped")) {
+                    if (!i.state.equals("stopped") && !i.state.equals("error")) {
                         i.state = code == 0 ? "stopped" : "error";
-                        addLog(i, "进程退出，exit code = " + code);
+                        if (code == 0) addLog(i, "进程已退出（exit code = 0）");
+                        else traceOf(i).issue(System.currentTimeMillis(), "", "进程退出，exit code = " + code);
                     }
                 } catch (Exception ignored) {}
             }, "dsh-log-" + i.id);
@@ -753,13 +1449,16 @@ public class Backend {
                         if (isPortOpen(i.port)) {
                             i.actualPort = i.port;
                             i.state = "running";
-                            addLog(i, "服务已就绪（端口探活）\u2192 " + i.url());
+                            logStage(i, "服务已就绪（端口探活）");
+                            traceOf(i).ready(System.currentTimeMillis());
+                            addLog(i, "工作台地址 → " + i.url());
+                            recordRunningSession(i, running.pid());
                             return;
                         }
                     }
                     if (i.state.equals("starting")) {
                         i.state = "error";
-                        addLog(i, "启动超时：15 秒内未检测到服务端口");
+                        traceOf(i).issue(System.currentTimeMillis(), "", "启动超时：15 秒内未检测到服务端口");
                     }
                 }, "dsh-probe-" + i.id);
                 probe.setDaemon(true);
@@ -771,11 +1470,178 @@ public class Backend {
         }
     }
 
+    /**
+     * 启动成功、拿到鉴权地址后写入会话记录。
+     *
+     * 记录的是 dsh 自身的出生身份（PID + starttime + boot_id + uid + cmdline），
+     * 宿主重建后据此判断“还是不是同一个实例”，不靠端口或名字猜。
+     */
+    static void recordRunningSession(Instance i, long pid) {
+        try {
+            int p = (int) pid;
+            String cmd = procCmdline(p);
+            long started = procStartTime(p);
+            // setsid 在少数环境会 fork：句柄 PID 可能是包装进程，真正的 node 在子进程里。
+            if (!looksLikeDshCmd(cmd)) {
+                int child = findDshDescendant(p);
+                if (child > 0) {
+                    p = child;
+                    cmd = procCmdline(p);
+                    started = procStartTime(p);
+                }
+            }
+            if (cmd.isEmpty() || started <= 0) {
+                addLog(i, "会话记录未写入：进程身份不可读（PID " + p + "）");
+                return;
+            }
+            Session s = new Session();
+            s.pid = p;
+            s.startTime = started;
+            s.bootId = bootId();
+            s.uid = procUid(p);
+            s.cmdline = cmd;
+            s.generation = GENERATION.incrementAndGet();
+            s.port = i.actualPort;
+            s.authUrl = i.workbenchUrl;
+            s.profile = i.profile;
+            s.instanceId = i.id;
+            i.session = s;
+            saveSession(i, s);
+        } catch (Exception e) {
+            addLog(i, "会话记录写入失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 判断一条 cmdline 是不是 dsh 本体（不含启动器/后端/包装脚本）。
+     *
+     * 真实命令行有几种形态，必须都认出来：
+     *   - /home/x/.npm-global/bin/dsh --profile web
+     *   - node /home/x/.npm-global/bin/dsh --profile web
+     *   - node --expose-internals .../@deepseek-ai/dsh/lib/bin.js --profile web
+     *   - npx @deepseek-ai/dsh --profile web
+     * 只有“dsh 一定带 --profile”不够：node 形态的第一个词是 node，旧判据会漏。
+     */
+    static boolean looksLikeDshCmd(String cmd) {
+        if (cmd == null || cmd.isEmpty()) return false;
+        String c = cmd.trim();
+        if (c.contains("dsh-backend") || c.contains("dsh-launcher")) return false;
+        String[] argv = c.split("\\s+");
+        if (argv.length == 0) return false;
+        String firstBase = argv[0].substring(argv[0].lastIndexOf('/') + 1);
+        // 裸可执行文件形态
+        if (firstBase.equals("dsh")) return true;
+        if (firstBase.equals("bin.js")) return c.contains("@deepseek-ai/dsh") || c.contains("dsh/lib/bin.js");
+        // node / nodejs / npx 形态：看后续参数里的入口脚本
+        if (firstBase.equals("node") || firstBase.equals("nodejs") || firstBase.equals("npx")) {
+            for (int k = 1; k < argv.length; k++) {
+                String a = argv[k];
+                if (a.startsWith("-")) continue;
+                String b = a.substring(a.lastIndexOf('/') + 1);
+                if (b.equals("dsh")) return true;
+                if (b.equals("bin.js") && (a.contains("@deepseek-ai/dsh") || a.contains("dsh/lib/bin.js"))) return true;
+                if (a.equals("@deepseek-ai/dsh") || a.startsWith("@deepseek-ai/dsh@")) return true;
+                break; // 只看第一个非选项参数
+            }
+            return false;
+        }
+        // 绝对路径里直接出现 dsh 入口
+        return c.contains("@deepseek-ai/dsh/lib/bin.js") || c.contains("/bin/dsh ");
+    }
+
+    /** 在进程的子孙里找 dsh（setsid fork 后的真实 node）。找不到返回 -1。 */
+    static int findDshDescendant(int pid) {
+        try {
+            List<ProcessHandle> kids = ProcessHandle.of(pid)
+                    .map(h -> h.descendants().toList())
+                    .orElse(List.of());
+            for (ProcessHandle h : kids) {
+                String cmd = procCmdline((int) h.pid());
+                if (looksLikeDshCmd(cmd)) return (int) h.pid();
+            }
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    /** 按记录身份停止接回的实例：不按端口/名字，只有身份核验通过才发信号。 */
+    static boolean stopAdopted(Instance i) {
+        Session s = i.session;
+        if (s == null) return false;
+        Observation o = observe(s);
+        if (o == Observation.EXITED) {
+            clearSession(i, s);
+            i.session = null;
+            i.state = "stopped";
+            i.actualPort = -1;
+            i.workbenchUrl = "";
+            addLog(i, "接回的 dsh 已确认退出。");
+            return true;
+        }
+        if (o == Observation.UNKNOWN) {
+            i.state = "unknown";
+            i.unknownReason = "IDENTITY_UNKNOWN";
+            addLog(i, "身份未确认，未发送任何信号。请点「重新核验」或「确认已退出」。");
+            return false;
+        }
+        addLog(i, "按记录身份停止接回的 dsh（PID " + s.pid + "）…");
+        try {
+            // 自己拉起的实例通常是 setsid 首领；外部接回的则只发给该 PID。
+            signalProcess(s.pid, "TERM");
+            long deadline = System.currentTimeMillis() + 8000;
+            while (System.currentTimeMillis() < deadline) {
+                if (observe(s) == Observation.EXITED) break;
+                Thread.sleep(120);
+            }
+            if (observe(s) != Observation.EXITED) {
+                signalProcess(s.pid, "KILL");
+                long hard = System.currentTimeMillis() + 4000;
+                while (System.currentTimeMillis() < hard && observe(s) != Observation.EXITED) {
+                    Thread.sleep(100);
+                }
+            }
+            Observation after = observe(s);
+            if (after == Observation.EXITED) {
+                clearSession(i, s);
+                i.session = null;
+                i.state = "stopped";
+                i.actualPort = -1;
+                i.workbenchUrl = "";
+                addLog(i, "已停止（PID " + s.pid + " 已确认退出）。");
+                return true;
+            }
+            i.state = "unknown";
+            i.unknownReason = after == Observation.UNKNOWN ? "IDENTITY_UNKNOWN" : "EXIT_UNCONFIRMED";
+            addLog(i, "停止未确认：进程状态为 " + after + "，记录与屏障保留。");
+            return false;
+        } catch (Exception e) {
+            i.state = "unknown";
+            i.unknownReason = "STOP_FAILED";
+            addLog(i, "停止失败：" + e.getMessage());
+            return false;
+        }
+    }
+
     static void stopInstance(Instance i) {
+        // 外部实例不归本启动器所有：停止按钮不能假装成功，也不替用户杀进程。
+        if ("conflict".equals(i.state)) {
+            addLog(i, "该 dsh 不是本启动器拉起的，停止按钮不会结束它；请用「仅结束外部实例」或「接管重启」。");
+            return;
+        }
+        // 接回的实例没有 Process 句柄，只能按记录身份停止。
+        if ("adopted".equals(i.state) || (i.session != null && i.proc == null)) {
+            stopAdopted(i);
+            return;
+        }
         Process p = i.proc;
         if (p == null || !p.isAlive()) {
+            Session s = i.session;
+            if (s != null) {
+                Observation o = observe(s);
+                if (o == Observation.EXITED) clearSession(i, s);
+            }
             i.state = "stopped";
             i.workbenchUrl = "";
+            i.session = null;
             return;
         }
         addLog(i, "正在停止（仅结束本后端派生的子进程树）…");
@@ -789,6 +1655,19 @@ public class Backend {
                     p.destroyForcibly();
                 }
             } catch (Exception ignored) {}
+            // 只有内核身份确认退出才退休记录；否则保留，下次启动会被屏障拦住。
+            Session s = i.session;
+            if (s != null) {
+                if (observe(s) == Observation.EXITED) {
+                    clearSession(i, s);
+                    i.session = null;
+                } else {
+                    i.state = "unknown";
+                    i.unknownReason = "EXIT_UNCONFIRMED";
+                    addLog(i, "进程句柄已结束，但身份核验未确认退出；记录与屏障保留。");
+                    return;
+                }
+            }
             addLog(i, "已停止");
         }).start();
     }
@@ -810,9 +1689,13 @@ public class Backend {
         mine.add(self);
         for (Instance i : inst) {
             Process p = i.proc;
-            if (p == null) continue;
-            mine.add(p.pid());
-            try { p.descendants().forEach(h -> mine.add(h.pid())); } catch (Exception ignored) {}
+            if (p != null) {
+                mine.add(p.pid());
+                try { p.descendants().forEach(h -> mine.add(h.pid())); } catch (Exception ignored) {}
+            }
+            // 已接回/已记录的实例也是「自己的」，不能被当成外部冲突。
+            Session s = i.session;
+            if (s != null && s.pid > 1) mine.add((long) s.pid);
         }
 
         // 直接扫 /proc 比 ProcessHandle.allProcesses() 可靠：
@@ -832,14 +1715,7 @@ public class Backend {
             } catch (Exception e) { continue; }
             if (cmd.isBlank()) continue;
             if (!cmd.contains("--profile")) continue;   // dsh 一定带 --profile
-            // 取命令行第一个词，判断它是不是 dsh（可能是绝对路径，也可能是裸名字）
-            String first = cmd.trim().split("\\s+", 2)[0];
-            String base = first.substring(first.lastIndexOf('/') + 1);
-            boolean isDsh = base.equals("dsh") || base.equals("bin.js")
-                    || cmd.contains("@deepseek-ai/dsh") || cmd.contains("dsh/lib/bin.js");
-            if (!isDsh) continue;
-            // 别把启动器自己算进去
-            if (cmd.contains("dsh-launcher") || cmd.contains("dsh-backend")) continue;
+            if (!looksLikeDshCmd(cmd)) continue;        // 统一判据，node/bin.js/npx 都认
             // 只认同一个 profile 的，不同 profile 允许并存
             if (profile != null && !profile.isBlank()) {
                 String p = profileOf(cmd);
@@ -861,16 +1737,107 @@ public class Backend {
     }
 
     static void addLog(Instance i, String msg) {
-        String line = "[" + LocalTime.now().format(TS) + "] " + msg;
-        synchronized (i.logs) {
-            i.logs.add(line);
-            while (i.logs.size() > MAX_LOG_LINES) {
-                i.logs.remove(0);
-                i.logDropped++;
-            }
-            // 唤醒正在长轮询的请求，做到「有日志立刻推」
-            i.logs.notifyAll();
+        addLog(i, msg, false);
+    }
+
+    /**
+     * 写一行日志。
+     *
+     * <p>移植 DSHA 的做法后，这里只负责「分派到结构化时间线」，不再靠关键词丢行：
+     *
+     * <ul>
+     *   <li>启动器自己的输出走 {@link StartupTrace#owned}，dsh 的原始输出走
+     *       {@link StartupTrace#add}，两者在 {@code Entry.kind} 上分开，
+     *       界面按 kind 分组就不会把插件输出误当阶段；
+     *   <li>脱敏、去 ANSI、去重、环形裁剪都由 {@link StartupTrace} 统一处理；
+     *   <li>「哪些行值得注意」由 {@link StartupLogDigest} 按规则分类，
+     *       而不是在这里静默吞掉——吞掉就等于丢证据。
+     * </ul>
+     */
+    static void addLog(Instance i, String msg, boolean fromDsh) {
+        if (msg == null || msg.isEmpty()) return;
+        StartupTrace t = traceOf(i);
+        long now = System.currentTimeMillis();
+        if (fromDsh) t.add(now, msg);
+        else t.owned(now, msg);
+    }
+
+    /** 从工作台地址里取出 launch token，登记后整条都会被打码。 */
+    static String tokenOf(String url) {
+        if (url == null) return "";
+        Matcher m = Pattern.compile("[?&]token=([A-Za-z0-9_\\-]{6,})").matcher(url);
+        return m.find() ? m.group(1) : "";
+    }
+
+    /** 实例状态 → 启动概览的整体结果（不从日志文本猜）。 */
+    static StartupLogDigest.Outcome outcomeOf(Instance i) {
+        if (i == null) return StartupLogDigest.Outcome.IDLE;
+        switch (i.state) {
+            case "running":
+            case "adopted":
+                return StartupLogDigest.Outcome.READY;
+            case "starting":
+                return StartupLogDigest.Outcome.RUNNING;
+            case "error":
+                return StartupLogDigest.Outcome.FAILED;
+            case "stopped":
+                return StartupLogDigest.Outcome.STOPPED;
+            default:
+                return StartupLogDigest.Outcome.IDLE;
         }
+    }
+
+    /** 阶段概览序列化：名称 / 起止 / 状态 / 占比所需的耗时 / 明细条数。 */
+    static String stagesJson(StartupLogDigest.Result d) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int k = 0; k < d.stages.size(); k++) {
+            StartupLogDigest.Stage st = d.stages.get(k);
+            if (k > 0) sb.append(',');
+            sb.append("{\"name\":").append(st.name == null ? "null" : "\"" + esc(st.name) + "\"")
+              .append(",\"startMs\":").append(st.startMs)
+              .append(",\"durationMs\":").append(st.durationMs)
+              .append(",\"state\":\"").append(st.state.name()).append("\"")
+              .append(",\"itemCount\":").append(st.items.size())
+              .append(",\"firstEntryIndex\":").append(st.firstEntryIndex)
+              .append('}');
+        }
+        return sb.append(']').toString();
+    }
+
+    /** 拿到实例的启动时间线；第一次用时按需创建。 */
+    static StartupTrace traceOf(Instance i) {
+        StartupTrace t = i.trace;
+        if (t == null) {
+            synchronized (i) {
+                if (i.trace == null) i.trace = new StartupTrace();
+                t = i.trace;
+            }
+        }
+        return t;
+    }
+
+    /** 兼容旧调用：把展示文本打码（token / 家目录 / 凭据形状）。 */
+    static String maskSecrets(String s) {
+        return SensitiveData.redact(s);
+    }
+
+    /** 阶段锚点：界面上一眼能看出走到哪一步。 */
+    static void logStage(Instance i, String stage) {
+        traceOf(i).stage(System.currentTimeMillis(), stage);
+    }
+
+    /** 命令行展示：家目录缩成 ~，dsh 可执行文件只留 basename，别让一长串路径把行撑爆。 */
+    static String prettyCmd(List<String> cmd) {
+        List<String> out = new ArrayList<>(cmd.size());
+        for (int k = 0; k < cmd.size(); k++) {
+            String c = cmd.get(k);
+            if (k == 0) {
+                int slash = c.lastIndexOf('/');
+                if (slash >= 0 && slash + 1 < c.length()) c = c.substring(slash + 1);
+            }
+            out.add(SensitiveData.redact(c));
+        }
+        return String.join(" ", out);
     }
 
     static String expand(String p) {
@@ -941,7 +1908,14 @@ public class Backend {
                 .append("\"patches\":\"").append(esc(i.patches)).append("\",")
                 .append("\"state\":\"").append(i.state).append("\",")
                 .append("\"actualPort\":").append(i.effectivePort()).append(',')
-                .append("\"url\":\"").append(esc(i.url())).append('"')
+                .append("\"url\":\"").append(esc(i.url())).append("\",")
+                .append("\"sessionPid\":").append(i.session == null ? 0 : i.session.pid).append(',')
+                .append("\"sessionPort\":").append(i.session == null ? -1 : i.session.port).append(',')
+                .append("\"unknownReason\":\"").append(esc(i.unknownReason)).append("\",")
+                .append("\"foreignPid\":\"").append(esc(i.foreignPid)).append("\",")
+                .append("\"foreignCmd\":\"").append(esc(i.foreignCmd)).append("\",")
+                .append("\"foreignPort\":").append(i.foreignPort).append(',')
+                .append("\"hasToken\":").append(i.workbenchUrl != null && i.workbenchUrl.contains("token="))
                 .append('}')
                 .toString();
     }
@@ -1604,10 +2578,10 @@ public class Backend {
     /** 统一 CORS：仅放行本地来源与 Tauri 壳，避免 * 的过宽松。 */
     static void cors(HttpExchange ex) {
         String origin = ex.getRequestHeaders().getFirst("Origin");
-        if (origin != null && ALLOWED_ORIGINS.contains(origin)) {
+        if (origin != null && isAllowedOrigin(origin)) {
             ex.getResponseHeaders().add("Access-Control-Allow-Origin", origin);
         } else {
-            // 非浏览器直接调用（如 curl）无 Origin 头，允许但不设置 CORS 头
+            // 非浏览器直接调用（如 curl）无 Origin 头；不设置具体来源即可
             ex.getResponseHeaders().add("Access-Control-Allow-Origin", "null");
         }
         ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
@@ -1729,8 +2703,86 @@ public class Backend {
         } catch (Exception ignored) {}
     }
 
+    /**
+     * 旧版在设置了 DSH_HOME 的进程里会把实例配置写到 $DSH_HOME/.config，
+     * 导致“从终端启动”和“从桌面启动”看到两份不同的实例列表。
+     * 这里只在标准位置缺失或更旧时迁移一次，并保留备份。
+     */
+    static void migrateLegacyConfig() {
+        try {
+            if (!Files.exists(LEGACY_CFG_FILE)) return;
+            if (LEGACY_CFG_FILE.toAbsolutePath().normalize()
+                    .equals(CFG_FILE.toAbsolutePath().normalize())) return;
+            Files.createDirectories(CFG_DIR);
+            if (!Files.exists(CFG_FILE)) {
+                Files.copy(LEGACY_CFG_FILE, CFG_FILE, StandardCopyOption.REPLACE_EXISTING);
+                System.out.println("[dsh-backend] 已迁移实例配置：" + LEGACY_CFG_FILE + " → " + CFG_FILE);
+                return;
+            }
+            // 旧位置更新：说明用户最近是从终端启动的，以它为准（先备份标准位置）。
+            if (Files.getLastModifiedTime(LEGACY_CFG_FILE)
+                    .compareTo(Files.getLastModifiedTime(CFG_FILE)) > 0) {
+                Files.copy(CFG_FILE, CFG_DIR.resolve("instances.json.bak-before-migrate"),
+                        StandardCopyOption.REPLACE_EXISTING);
+                Files.copy(LEGACY_CFG_FILE, CFG_FILE, StandardCopyOption.REPLACE_EXISTING);
+                System.out.println("[dsh-backend] 旧位置配置较新，已采用：" + LEGACY_CFG_FILE);
+                return;
+            }
+            // 两边都有：不覆盖，按 id 合并，缺的补进来（旧位置另存备份）。
+            String legacy = Files.readString(LEGACY_CFG_FILE, StandardCharsets.UTF_8);
+            String current = Files.readString(CFG_FILE, StandardCharsets.UTF_8);
+            Set<String> ids = new HashSet<>();
+            Set<String> profiles = new HashSet<>();
+            Matcher cm = Pattern.compile("\\{([^{}]*)\\}").matcher(current);
+            while (cm.find()) {
+                Map<String, String> d = flatJson("{" + cm.group(1) + "}");
+                if (d.get("id") != null) ids.add(d.get("id"));
+                if (d.get("profile") != null) profiles.add(d.get("profile"));
+            }
+            StringBuilder merged = new StringBuilder();
+            Matcher lm = Pattern.compile("\\{([^{}]*)\\}").matcher(legacy);
+            int added = 0;
+            while (lm.find()) {
+                Map<String, String> d = flatJson("{" + lm.group(1) + "}");
+                String id = d.get("id");
+                if (id == null || ids.contains(id)) continue;
+                // 同 profile 已有实例就不再补：dsh 按 profile 加排他锁，重复条目只会制造假冲突。
+                String prof = d.getOrDefault("profile", "");
+                if (!prof.isBlank() && profiles.contains(prof)) continue;
+                ids.add(id);
+                if (!prof.isBlank()) profiles.add(prof);
+                merged.append(added > 0 || !current.trim().equals("[]") ? ",\n  " : "\n  ");
+                merged.append("{");
+                boolean firstField = true;
+                for (Map.Entry<String, String> e : d.entrySet()) {
+                    if (!firstField) merged.append(',');
+                    firstField = false;
+                    String v = e.getValue();
+                    boolean numeric = v.matches("-?[0-9]+") || v.equals("true") || v.equals("false");
+                    merged.append('"').append(esc(e.getKey())).append("\":");
+                    if (numeric) merged.append(v);
+                    else merged.append('"').append(esc(v)).append('"');
+                }
+                merged.append("}");
+                added++;
+            }
+            if (added == 0) return;
+            Files.copy(CFG_FILE, CFG_DIR.resolve("instances.json.bak-before-merge"),
+                    StandardCopyOption.REPLACE_EXISTING);
+            String body = current.trim();
+            if (body.endsWith("]")) body = body.substring(0, body.lastIndexOf(']')).trim();
+            if (body.equals("[")) body = "[";
+            String next = body + merged + "\n]\n";
+            Files.writeString(CFG_FILE, next, StandardCharsets.UTF_8);
+            System.out.println("[dsh-backend] 已合并旧位置实例配置 " + added + " 条：" + LEGACY_CFG_FILE);
+        } catch (Exception e) {
+            System.out.println("[dsh-backend] 配置迁移跳过：" + e.getMessage());
+        }
+    }
+
     static void loadConfig() {
         inst.clear();
+        migrateLegacyConfig();
         if (!Files.exists(CFG_FILE)) return;
         try {
             String js = Files.readString(CFG_FILE, StandardCharsets.UTF_8);
